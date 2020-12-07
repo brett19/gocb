@@ -3,11 +3,11 @@ package gocb
 import (
 	"encoding/json"
 	"fmt"
-	"strings"
 	"testing"
 	"time"
 
-	gojcbmock "github.com/couchbase/gocbcore/v9/jcbmock"
+	cavescli "github.com/couchbaselabs/gocaves/client"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -27,38 +27,29 @@ type IntegrationTestSuite struct {
 func (suite *IntegrationTestSuite) SetupSuite() {
 	var err error
 	var connStr string
-	var mock *gojcbmock.Mock
+	var mock *cavescli.Client
+	var mockID string
 	var auth PasswordAuthenticator
 	if globalConfig.Server == "" {
 		if globalConfig.Version != "" {
 			panic("version cannot be specified with mock")
 		}
 
-		mpath, err := gojcbmock.GetMockPath()
+		mock, err = cavescli.NewClient(cavescli.NewClientOptions{
+			Path: "/Users/brettlawson/couchsdk/gocaves/main.go",
+		})
+		if err != nil {
+			panic(err.Error())
+		}
+
+		mockID = uuid.New().String()
+		connStr, err = mock.CreateCluster(mockID)
 		if err != nil {
 			panic(err.Error())
 		}
 
 		globalConfig.Bucket = "default"
-		mock, err = gojcbmock.NewMock(mpath, 4, 1, 64, []gojcbmock.BucketSpec{
-			{Name: "default", Type: gojcbmock.BCouchbase},
-		}...)
-		if err != nil {
-			panic(err.Error())
-		}
-
-		mock.Control(gojcbmock.NewCommand(gojcbmock.CSetCCCP,
-			map[string]interface{}{"enabled": "true"}))
-		mock.Control(gojcbmock.NewCommand(gojcbmock.CSetSASLMechanisms,
-			map[string]interface{}{"mechs": []string{"SCRAM-SHA512"}}))
-
-		globalConfig.Version = mock.Version()
-
-		var addrs []string
-		for _, mcport := range mock.MemcachedPorts() {
-			addrs = append(addrs, fmt.Sprintf("127.0.0.1:%d", mcport))
-		}
-		connStr = fmt.Sprintf("couchbase://%s", strings.Join(addrs, ","))
+		globalConfig.Version = "1.5.6"
 		globalConfig.Server = connStr
 		auth = PasswordAuthenticator{
 			Username: "Administrator",
@@ -90,6 +81,7 @@ func (suite *IntegrationTestSuite) SetupSuite() {
 	globalCluster = &testCluster{
 		Cluster:      cluster,
 		Mock:         mock,
+		MockID:       mockID,
 		Version:      nodeVersion,
 		FeatureFlags: globalConfig.FeatureFlags,
 	}
@@ -112,6 +104,12 @@ func (suite *IntegrationTestSuite) SetupSuite() {
 func (suite *IntegrationTestSuite) TearDownSuite() {
 	err := globalCluster.Close(nil)
 	suite.Require().Nil(err, err)
+
+	if globalCluster.Mock != nil {
+		err = globalCluster.Mock.Shutdown()
+		suite.Require().Nil(err, err)
+	}
+
 }
 
 func (suite *IntegrationTestSuite) createBreweryDataset(datasetName, service, scope, collection string) (int, error) {

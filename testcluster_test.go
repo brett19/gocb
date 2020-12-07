@@ -1,10 +1,9 @@
 package gocb
 
 import (
-	"math"
 	"time"
 
-	gojcbmock "github.com/couchbase/gocbcore/v9/jcbmock"
+	cavescli "github.com/couchbaselabs/gocaves/client"
 )
 
 var (
@@ -82,7 +81,8 @@ func (e testClusterErrorWrap) Unwrap() error {
 
 type testCluster struct {
 	*Cluster
-	Mock    *gojcbmock.Mock
+	Mock    *cavescli.Client
+	MockID  string
 	Version *NodeVersion
 
 	FeatureFlags []TestFeatureFlag
@@ -158,6 +158,8 @@ func (c *testCluster) SupportsFeature(feature FeatureCode) bool {
 			supported = false
 		case CollectionsQueryFeature:
 			supported = false
+		case ViewFeature:
+			supported = false
 		}
 	} else {
 		switch feature {
@@ -230,11 +232,8 @@ func (c *testCluster) NotSupportsFeature(feature FeatureCode) bool {
 }
 
 func (c *testCluster) TimeTravel(waitDura time.Duration) {
-	if c.isMock() {
-		waitSecs := int(math.Ceil(float64(waitDura) / float64(time.Second)))
-		c.Mock.Control(gojcbmock.NewCommand(gojcbmock.CTimeTravel, map[string]interface{}{
-			"Offset": waitSecs,
-		}))
+	if c.Mock != nil {
+		c.Mock.TimeTravelCluster(c.MockID)
 	} else {
 		time.Sleep(waitDura)
 	}

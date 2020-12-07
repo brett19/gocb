@@ -3,6 +3,7 @@ package gocb
 import (
 	"encoding/json"
 	"errors"
+	"log"
 	"reflect"
 	"testing"
 	"time"
@@ -1418,7 +1419,14 @@ func (suite *IntegrationTestSuite) TestTouchMissingDocFail() {
 	}
 }
 
+func (suite *IntegrationTestSuite) TestInsertReplicateStartupWait() {
+	suite.skipIfUnsupported(KeyValueFeature)
+
+	globalCollection.Get("touchMissing", nil)
+}
+
 func (suite *IntegrationTestSuite) TestInsertReplicateToGetAnyReplica() {
+	suite.T().Skip()
 	suite.skipIfUnsupported(KeyValueFeature)
 	suite.skipIfUnsupported(ReplicasFeature)
 
@@ -1482,6 +1490,8 @@ func (suite *IntegrationTestSuite) TestInsertReplicateToGetAllReplicas() {
 	}
 
 	expectedReplicas := numReplicas + 1
+
+	log.Printf("Upserting %d", expectedReplicas)
 
 	mutRes, err := globalCollection.Upsert("insertAllReplicaDoc", doc, &UpsertOptions{
 		PersistTo: uint(expectedReplicas),
