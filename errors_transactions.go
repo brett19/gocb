@@ -61,6 +61,8 @@ var (
 	ErrConcurrentOperationsDetectedOnSameDocument = gocbcore.ErrConcurrentOperationsDetectedOnSameDocument
 )
 
+// TransactionFailedError is returned when a transaction did not commit, for example because an operation failed in a
+// way which could not be retried. Any changes the transaction staged were rolled back, or will be removed by cleanup.
 type TransactionFailedError struct {
 	cause  error
 	result *TransactionResult
@@ -82,6 +84,14 @@ func (tfe TransactionFailedError) Result() *TransactionResult {
 	return tfe.result
 }
 
+// TransactionExpiredError is returned when a transaction reached its timeout before it could commit. The transaction
+// did not commit. Once a transaction has expired it is not retried and it is not rolled back: anything it staged is
+// left for cleanup to remove. Operations which were started before the timeout are allowed to finish for at most
+// a short grace period (gocbcore.TransactionExpiryGrace, 2.5s) after it, so the transaction returns no later than
+// that.
+//
+// errors.Is(err, ErrAttemptExpired) is true for this error. If the transaction expired while deciding whether to
+// retry after an error, that error is included in the message.
 type TransactionExpiredError struct {
 	cause  error
 	result *TransactionResult
@@ -103,6 +113,9 @@ func (tfe TransactionExpiredError) Result() *TransactionResult {
 	return tfe.result
 }
 
+// TransactionCommitAmbiguousError is returned when the transaction may or may not have committed, for example because
+// the write that commits it timed out or the transaction expired while its outcome was being resolved. Under no
+// circumstances is a transaction rolled back after an ambiguous commit.
 type TransactionCommitAmbiguousError struct {
 	cause  error
 	result *TransactionResult

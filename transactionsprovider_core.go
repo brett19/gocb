@@ -74,7 +74,7 @@ func transactionsRetryBackoff(retry int) time.Duration {
 // its expiry has been reached or the HasExpiredClientSideHook reports it expired at stage
 // transactionsHookBeforeRetry.
 func transactionHasExpiredBeforeRetry(attempt *TransactionAttemptContext, hooksWrapper transactionHooksWrapper) bool {
-	if attempt.txn.TimeRemaining() <= 0 {
+	if attempt.txn.HasExpired() || attempt.txn.TimeRemaining() <= 0 {
 		return true
 	}
 
@@ -396,18 +396,6 @@ func (t *transactionsProviderCore) Run(logicFn AttemptFunc, perConfig *Transacti
 				},
 			}
 		case gocbcore.TransactionErrorReasonTransactionExpired:
-			// If we expired during gocbcore auto-rollback then we return failed with the error cause rather
-			// than expired. This occurs when we commit itself errors and gocbcore auto rolls back the transaction.
-			if attempt.attempt().PreExpiryAutoRollback {
-				return nil, &TransactionFailedError{
-					cause: finalErrCause,
-					result: &TransactionResult{
-						TransactionID:     txn.ID(),
-						UnstagingComplete: false,
-						Logs:              logger.Logs(),
-					},
-				}
-			}
 			return nil, &TransactionExpiredError{
 				cause: finalErrCause,
 				result: &TransactionResult{

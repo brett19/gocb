@@ -9,9 +9,8 @@ import (
 )
 
 type transactionAttempt struct {
-	State                 TransactionAttemptState
-	PreExpiryAutoRollback bool
-	Expired               bool
+	State   TransactionAttemptState
+	Expired bool
 }
 
 type transactionQueryState struct {
@@ -70,9 +69,8 @@ func (c *TransactionAttemptContext) finalErrorToRaise() gocbcore.TransactionErro
 func (c *TransactionAttemptContext) attempt() transactionAttempt {
 	a := c.txn.Attempt()
 	return transactionAttempt{
-		State:                 TransactionAttemptState(a.State),
-		PreExpiryAutoRollback: a.PreExpiryAutoRollback,
-		Expired:               c.txn.TimeRemaining() <= 0 || a.Expired,
+		State:   TransactionAttemptState(a.State),
+		Expired: c.txn.TimeRemaining() <= 0 || a.Expired,
 	}
 }
 
