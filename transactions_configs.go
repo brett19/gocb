@@ -32,8 +32,16 @@ type TransactionsConfig struct {
 	// MetadataCollection specifies a specific location to place meta-data.
 	MetadataCollection *TransactionKeyspace
 
-	// ExpirationTimout sets the maximum time that transactions created
-	// by this Transactions object can run for, before expiring.
+	// Timeout sets the maximum time that transactions created by this
+	// Transactions object can run for, before expiring. This is a bound on the
+	// whole transaction, including all of its attempts. A transaction which
+	// expires before it commits returns a TransactionExpiredError and is not
+	// retried. Operations which were started before the timeout may run for at
+	// most a short grace period (gocbcore.TransactionExpiryGrace, 2.5s) after it,
+	// so a transaction returns no later than Timeout plus that grace, plus the
+	// time taken by the application's own code. Once a transaction has run a
+	// query, the query service takes over enforcing the timeout, and the SDK
+	// only gives up waiting for a query a little (3.5s) after the timeout.
 	Timeout time.Duration
 
 	// DurabilityLevel specifies the durability level that should be used
@@ -62,7 +70,11 @@ type TransactionOptions struct {
 	// for all write operations performed by this transaction.
 	DurabilityLevel DurabilityLevel
 
-	// Timeout sets the maximum time that this transaction can run for, before expiring.
+	// Timeout sets the maximum time that this transaction can run for, before
+	// expiring. It overrides TransactionsConfig.Timeout, and is bounded in the
+	// same way: the transaction returns no later than Timeout plus a short grace
+	// period (gocbcore.TransactionExpiryGrace, 2.5s), plus the time taken by the
+	// application's own code.
 	Timeout time.Duration
 
 	// MetadataCollection specifies a specific Collection to place meta-data.
