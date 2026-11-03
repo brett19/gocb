@@ -2,7 +2,7 @@ package gocb
 
 import (
 	"errors"
-	"math"
+	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -44,10 +44,31 @@ type transactionsProviderCoreOptions struct {
 const (
 	transactionsUnstagingParallelismLimit = 1000
 
+	// transactionsMinRetryBackoff and transactionsMaxRetryBackoff bound the backoff applied before retrying a
+	// transaction attempt (the spec's OpRetryBackoff).
+	transactionsMinRetryBackoff = 1 * time.Millisecond
+	transactionsMaxRetryBackoff = 100 * time.Millisecond
+
 	// transactionsHookBeforeRetry is the stage passed to the HasExpiredClientSideHook when checking for expiry
 	// before retrying an attempt. It matches the stage name used by the other SDKs.
 	transactionsHookBeforeRetry = "beforeRetry"
 )
+
+// transactionsRetryBackoff returns how long to wait before starting retry number `retry` (1 for the first retry) of a
+// transaction. The ceiling grows exponentially from transactionsMinRetryBackoff up to transactionsMaxRetryBackoff,
+// and the wait is chosen uniformly at random between transactionsMinRetryBackoff and that ceiling, so that
+// transactions which conflict with each other do not keep retrying in lockstep.
+func transactionsRetryBackoff(retry int) time.Duration {
+	ceiling := transactionsMaxRetryBackoff
+	// Shifting by more than this would exceed the maximum anyway, and could overflow.
+	if retry < 8 {
+		if c := transactionsMinRetryBackoff << max(retry, 0); c < ceiling {
+			ceiling = c
+		}
+	}
+
+	return transactionsMinRetryBackoff + rand.N(ceiling-transactionsMinRetryBackoff+1)
+}
 
 // transactionHasExpiredBeforeRetry reports whether the transaction has expired and so must not be retried: either
 // its expiry has been reached or the HasExpiredClientSideHook reports it expired at stage
@@ -253,22 +274,6 @@ func (t *transactionsProviderCore) Run(logicFn AttemptFunc, perConfig *Transacti
 	logger.setTxnID(txn.ID())
 
 	retries := 0
-	backoffCalc := func() time.Duration {
-		var max float64 = 100000000 // 100 Milliseconds
-		var min float64 = 1000000   // 1 Millisecond
-		retries++
-		backoff := min * (math.Pow(2, float64(retries)))
-
-		if backoff > max {
-			backoff = max
-		}
-		if backoff < min {
-			backoff = min
-		}
-
-		return time.Duration(backoff)
-	}
-
 	for {
 		err = txn.NewAttempt()
 		if err != nil {
@@ -349,8 +354,9 @@ func (t *transactionsProviderCore) Run(logicFn AttemptFunc, perConfig *Transacti
 				})
 				toRaise = attempt.finalErrorToRaise()
 			} else {
-				logDebugf("retrying lambda after backoff")
-				sleep := backoffCalc()
+				retries++
+				sleep := transactionsRetryBackoff(retries)
+				logDebugf("retrying lambda after backoff of %s", sleep)
 				logger.logInfof(attemptID, "Will retry lambda after %s", sleep)
 				time.Sleep(sleep)
 				continue

@@ -168,3 +168,24 @@ func (suite *UnitTestSuite) TestTransactionsNoRetryAfterFailedAutoRollback() {
 	suite.Assert().True(hooks.sawStage("queryRollback"))
 	suite.Assert().False(hooks.sawStage(transactionsHookBeforeRetry))
 }
+
+func (suite *UnitTestSuite) TestTransactionsRetryBackoffJitter() {
+	for retry := 0; retry <= 20; retry++ {
+		ceiling := transactionsMaxRetryBackoff
+		if retry < 8 && transactionsMinRetryBackoff<<retry < ceiling {
+			ceiling = transactionsMinRetryBackoff << retry
+		}
+
+		seen := make(map[time.Duration]struct{})
+		for i := 0; i < 1000; i++ {
+			backoff := transactionsRetryBackoff(retry)
+			suite.Require().GreaterOrEqual(backoff, transactionsMinRetryBackoff, "retry %d", retry)
+			suite.Require().LessOrEqual(backoff, ceiling, "retry %d", retry)
+			seen[backoff] = struct{}{}
+		}
+
+		if ceiling > transactionsMinRetryBackoff {
+			suite.Assert().Greater(len(seen), 1, "retry %d should be jittered", retry)
+		}
+	}
+}
