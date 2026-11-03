@@ -188,3 +188,9 @@ func (suite *UnitTestSuite) TestTransactionsRetryBackoffJitter() {
 		}
 	}
 }
+
+func (suite *UnitTestSuite) TestTransactionQueryTimeout() {
+	suite.Assert().Equal(10*time.Second+gocbcore.TransactionExpiryGrace+time.Second, transactionQueryTimeout(10*time.Second))
+	suite.Assert().Equal(gocbcore.TransactionExpiryGrace+time.Second, transactionQueryTimeout(0))
+	suite.Assert().Equal(gocbcore.TransactionExpiryGrace+time.Second, transactionQueryTimeout(-time.Second))
+}

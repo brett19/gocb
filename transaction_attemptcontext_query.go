@@ -703,7 +703,7 @@ func (c *TransactionAttemptContext) queryWrapper(scope *Scope, statement string,
 		// Need to make sure we don't end up straight back here...
 		options.AsTransaction = nil
 	}
-	options.Timeout = cfg.ExpirationTime + cfg.KeyValueTimeout + (1 * time.Second)
+	options.Timeout = transactionQueryTimeout(c.txn.TimeRemaining())
 
 	err = c.hooks.BeforeQuery(*c, statement)
 	if err != nil {
@@ -727,6 +727,17 @@ func (c *TransactionAttemptContext) queryWrapper(scope *Scope, statement string,
 	}
 
 	return result, nil
+}
+
+// transactionQueryTimeout returns the SDK-side timeout for a query issued as part of a transaction, given the time
+// remaining before the transaction expires. The query service enforces the transaction's expiry itself, so this is
+// only a safety net: it allows for the grace that operations may run past expiry (gocbcore.TransactionExpiryGrace),
+// plus a second for network latency.
+func transactionQueryTimeout(remaining time.Duration) time.Duration {
+	if remaining < 0 {
+		remaining = 0
+	}
+	return remaining + gocbcore.TransactionExpiryGrace + time.Second
 }
 
 func (c *TransactionAttemptContext) queryBeginWork(scope *Scope) (errOut error) {
