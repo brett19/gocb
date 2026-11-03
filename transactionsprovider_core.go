@@ -43,7 +43,40 @@ type transactionsProviderCoreOptions struct {
 
 const (
 	transactionsUnstagingParallelismLimit = 1000
+
+	// transactionsHookBeforeRetry is the stage passed to the HasExpiredClientSideHook when checking for expiry
+	// before retrying an attempt. It matches the stage name used by the other SDKs.
+	transactionsHookBeforeRetry = "beforeRetry"
 )
+
+// transactionHasExpiredBeforeRetry reports whether the transaction has expired and so must not be retried: either
+// its expiry has been reached or the HasExpiredClientSideHook reports it expired at stage
+// transactionsHookBeforeRetry.
+func transactionHasExpiredBeforeRetry(attempt *TransactionAttemptContext, hooksWrapper transactionHooksWrapper) bool {
+	if attempt.txn.TimeRemaining() <= 0 {
+		return true
+	}
+
+	if hooksWrapper == nil {
+		return false
+	}
+
+	type hookResult struct {
+		expired bool
+		err     error
+	}
+	waitCh := make(chan hookResult, 1)
+	hooksWrapper.HasExpiredClientSideHook(transactionsHookBeforeRetry, nil, func(expired bool, err error) {
+		waitCh <- hookResult{expired: expired, err: err}
+	})
+	res := <-waitCh
+	if res.err != nil {
+		logWarnf("HasExpired hook returned an unexpected error before retry, ignoring: %s", res.err)
+		return false
+	}
+
+	return res.expired
+}
 
 func newTransactionsProviderCore(config TransactionsConfig, opts transactionsProviderCoreOptions, provider agentProvider) *transactionsProviderCore {
 	return &transactionsProviderCore{
@@ -296,11 +329,23 @@ func (t *transactionsProviderCore) Run(logicFn AttemptFunc, perConfig *Transacti
 		toRaise := attempt.finalErrorToRaise()
 
 		if attempt.shouldRetry() && toRaise != gocbcore.TransactionErrorReasonSuccess {
-			logDebugf("retrying lambda after backoff")
-			sleep := backoffCalc()
-			logger.logInfof(attemptID, "Will retry lambda after %s", sleep)
-			time.Sleep(sleep)
-			continue
+			if transactionHasExpiredBeforeRetry(&attempt, hooksWrapper) {
+				// The transaction has expired, so we never start another attempt. We raise expired, with the error
+				// that would have caused the retry as its cause.
+				logger.logInfof(attemptID, "Transaction has expired, will not retry")
+				attempt.txn.UpdateState(gocbcore.TransactionUpdateStateOptions{
+					ShouldNotRetry:    true,
+					ShouldNotRollback: true,
+					Reason:            gocbcore.TransactionErrorReasonTransactionExpired,
+				})
+				toRaise = attempt.finalErrorToRaise()
+			} else {
+				logDebugf("retrying lambda after backoff")
+				sleep := backoffCalc()
+				logger.logInfof(attemptID, "Will retry lambda after %s", sleep)
+				time.Sleep(sleep)
+				continue
+			}
 		}
 
 		// We don't want the TOF to be the cause in the final error we return so we unwrap it.
@@ -350,6 +395,7 @@ func (t *transactionsProviderCore) Run(logicFn AttemptFunc, perConfig *Transacti
 				}
 			}
 			return nil, &TransactionExpiredError{
+				cause: finalErrCause,
 				result: &TransactionResult{
 					TransactionID:     txn.ID(),
 					UnstagingComplete: false,

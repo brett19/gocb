@@ -83,11 +83,15 @@ func (tfe TransactionFailedError) Result() *TransactionResult {
 }
 
 type TransactionExpiredError struct {
+	cause  error
 	result *TransactionResult
 }
 
 func (tfe TransactionExpiredError) Error() string {
-	return ErrAttemptExpired.Error()
+	if tfe.cause == nil || errors.Is(tfe.cause, ErrAttemptExpired) {
+		return ErrAttemptExpired.Error()
+	}
+	return ErrAttemptExpired.Error() + " | " + tfe.cause.Error()
 }
 
 func (tfe TransactionExpiredError) Unwrap() error {
