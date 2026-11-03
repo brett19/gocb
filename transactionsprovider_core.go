@@ -315,6 +315,7 @@ func (t *transactionsProviderCore) Run(logicFn AttemptFunc, perConfig *Transacti
 		}
 
 		finalErr := lambdaErr
+		autoRollbackFailed := false
 		if !singleQueryMode {
 			if attempt.canCommit() {
 				finalErr = attempt.commit()
@@ -323,13 +324,21 @@ func (t *transactionsProviderCore) Run(logicFn AttemptFunc, perConfig *Transacti
 				rollbackErr := attempt.rollback()
 				if rollbackErr != nil {
 					logWarnf("rollback after error failed: %s", rollbackErr)
+					logger.logInfof(attemptID, "Auto-rollback failed, will not retry")
+					autoRollbackFailed = true
 				}
 			}
 		}
 		toRaise := attempt.finalErrorToRaise()
 
 		if attempt.shouldRetry() && toRaise != gocbcore.TransactionErrorReasonSuccess {
-			if transactionHasExpiredBeforeRetry(&attempt, hooksWrapper) {
+			if autoRollbackFailed {
+				// The attempt was not cleanly rolled back, so we do not retry. The error that caused the rollback is
+				// what gets raised, rather than the rollback error.
+				attempt.txn.UpdateState(gocbcore.TransactionUpdateStateOptions{
+					ShouldNotRetry: true,
+				})
+			} else if transactionHasExpiredBeforeRetry(&attempt, hooksWrapper) {
 				// The transaction has expired, so we never start another attempt. We raise expired, with the error
 				// that would have caused the retry as its cause.
 				logger.logInfof(attemptID, "Transaction has expired, will not retry")

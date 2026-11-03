@@ -136,3 +136,35 @@ func (suite *UnitTestSuite) TestTransactionsNoRetryWhenHookExpiresBeforeRetry() 
 	suite.Assert().Equal(1, attempts)
 	suite.Assert().True(hooks.sawStage(transactionsHookBeforeRetry))
 }
+
+func (suite *UnitTestSuite) TestTransactionsNoRetryAfterFailedAutoRollback() {
+	txns := suite.newTxnTestTransactions()
+	defer txns.close()
+
+	// Rollback in query mode sends a ROLLBACK statement, which first consults the HasExpired hook at stage
+	// queryRollback. Failing the hook there makes the auto-rollback fail without touching a cluster.
+	errRollback := errors.New("rollback failed")
+	hooks := &txnTestHooks{
+		fn: func(stage string) (bool, error) {
+			if stage == "queryRollback" {
+				return false, errRollback
+			}
+			return false, nil
+		},
+	}
+	attempts := 0
+	_, err := txns.Run(func(ctx *TransactionAttemptContext) error {
+		attempts++
+		ctx.queryState = &transactionQueryState{}
+		return retryableFailure(ctx)
+	}, txnTestOptions(30*time.Second, hooks), false)
+
+	var failedErr *TransactionFailedError
+	suite.Require().ErrorAs(err, &failedErr)
+	// The error which caused the rollback is raised, not the rollback error.
+	suite.Assert().ErrorIs(err, errTxnTest)
+	suite.Assert().NotErrorIs(err, errRollback)
+	suite.Assert().Equal(1, attempts)
+	suite.Assert().True(hooks.sawStage("queryRollback"))
+	suite.Assert().False(hooks.sawStage(transactionsHookBeforeRetry))
+}
