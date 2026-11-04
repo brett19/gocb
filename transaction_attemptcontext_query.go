@@ -44,8 +44,7 @@ func (c *TransactionAttemptContext) getQueryMode(collection *Collection, id stri
 
 	b, err := json.Marshal(txdata)
 	if err != nil {
-		// TODO: should we be wrapping this? It really shouldn't happen...
-		return nil, err
+		return nil, operationFailedFromError(err, c)
 	}
 
 	handleErr := func(err error) error {
@@ -156,7 +155,7 @@ func (c *TransactionAttemptContext) replaceQueryMode(doc *TransactionGetResult, 
 
 	b, err := json.Marshal(txdata)
 	if err != nil {
-		return nil, err
+		return nil, operationFailedFromError(err, c)
 	}
 
 	handleErr := func(err error) error {
@@ -350,7 +349,7 @@ func (c *TransactionAttemptContext) removeQueryMode(doc *TransactionGetResult) e
 
 	b, err := json.Marshal(txdata)
 	if err != nil {
-		return err
+		return operationFailedFromError(err, c)
 	}
 
 	handleErr := func(err error) error {

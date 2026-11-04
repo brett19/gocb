@@ -345,7 +345,7 @@ func (c *TransactionAttemptContext) insert(collection *Collection, id string, va
 
 	a, err := collection.Bucket().Internal().IORouter()
 	if err != nil {
-		return nil, err
+		return nil, operationFailedFromError(err, c)
 	}
 
 	waitCh := make(chan struct{}, 1)

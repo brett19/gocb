@@ -2,6 +2,7 @@ package gocb
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -884,6 +885,102 @@ func (suite *UnitTestSuite) TestQueryWrapperUpdateInternalState() {
 				return nil
 			}, txnTestOptions(30*time.Second, nil), false)
 			suite.Require().NoError(txns.close())
+		}
+	}
+}
+
+var errTxnTestIORouter = errors.New("test IORouter failure")
+
+// A KV mode operation that cannot get the bucket's agent fails the transaction, as gocb rather than gocbcore raises
+// the error: it leaves the attempt unable to commit, whether the lambda returns the error or swallows it.
+func (suite *UnitTestSuite) TestKVModeIORouterFailureDoesNotCommit() {
+	cli := new(mockConnectionManager)
+	cli.On("connection", "default").Return((*gocbcore.Agent)(nil), errTxnTestIORouter)
+	collection := newBucket("default", cli, nil).DefaultCollection()
+
+	ops := map[string]func(ctx *TransactionAttemptContext) error{
+		"insert": func(ctx *TransactionAttemptContext) error {
+			_, err := ctx.Insert(collection, "id", "value")
+			return err
+		},
+		"get": func(ctx *TransactionAttemptContext) error {
+			_, err := ctx.Get(collection, "id")
+			return err
+		},
+		"bulk get": func(ctx *TransactionAttemptContext) error {
+			_, err := ctx.BulkGet([]TransactionBulkGetSpec{{Collection: collection, ID: "id"}}, nil)
+			return err
+		},
+	}
+	for name, op := range ops {
+		for _, swallow := range []bool{false, true} {
+			txns := suite.newTxnTestTransactions()
+			_, err := txns.Run(func(ctx *TransactionAttemptContext) error {
+				err := op(ctx)
+				suite.assertOperationFailedWith(err, errTxnTestIORouter, "%s, swallowed: %t", name, swallow)
+				var tErr *TransactionOperationFailedError
+				if errors.As(err, &tErr) {
+					suite.Assert().False(tErr.Retry(), "%s, swallowed: %t", name, swallow)
+				}
+				suite.Assert().False(ctx.canCommit(), "%s, swallowed: %t: a failed attempt may not be committed",
+					name, swallow)
+				if swallow {
+					return nil
+				}
+				return err
+			}, txnTestOptions(30*time.Second, nil), false)
+
+			suite.Assert().IsType(&TransactionFailedError{}, err, "%s, swallowed: %t", name, swallow)
+			if !swallow {
+				suite.Assert().ErrorIs(err, errTxnTestIORouter, name)
+			}
+			suite.Require().NoError(txns.close())
+		}
+	}
+}
+
+// A query mode replace or remove whose txdata cannot be encoded fails the transaction, so no COMMIT follows.
+func (suite *UnitTestSuite) TestQueryModeTxDataEncodeFailureDoesNotCommit() {
+	collection := newBucket("default", nil, nil).DefaultCollection()
+	doc := &TransactionGetResult{
+		collection: collection,
+		docID:      "id",
+		coreRes:    &gocbcore.TransactionGetResult{},
+		txnMeta:    json.RawMessage("{not json"),
+	}
+	ops := map[string]func(ctx *TransactionAttemptContext) error{
+		"replace": func(ctx *TransactionAttemptContext) error {
+			_, err := ctx.Replace(doc, "value")
+			return err
+		},
+		"remove": func(ctx *TransactionAttemptContext) error {
+			return ctx.Remove(doc)
+		},
+	}
+	for name, op := range ops {
+		for _, swallow := range []bool{false, true} {
+			sent, err := suite.runQueryModeLambda(nil, nil, func(ctx *TransactionAttemptContext) error {
+				_, err := ctx.Query("UPDATE `default` SET foo = 1", nil)
+				suite.Require().NoError(err)
+
+				err = op(ctx)
+				var tErr *TransactionOperationFailedError
+				if suite.Assert().ErrorAs(err, &tErr, "%s, swallowed: %t", name, swallow) {
+					var marshalErr *json.MarshalerError
+					suite.Assert().ErrorAs(tErr.InternalUnwrap(), &marshalErr, "%s, swallowed: %t", name, swallow)
+					suite.Assert().Equal(gocbcore.TransactionErrorReasonTransactionFailed, tErr.shouldRaise, name)
+					suite.Assert().False(tErr.Retry(), name)
+				}
+				suite.Assert().False(ctx.canCommit(), "%s, swallowed: %t", name, swallow)
+				if swallow {
+					return nil
+				}
+				return err
+			})
+
+			suite.Assert().IsType(&TransactionFailedError{}, err, "%s, swallowed: %t", name, swallow)
+			suite.Assert().Equal([]string{"BEGIN WORK", "UPDATE `default` SET foo = 1", "ROLLBACK"}, sent,
+				"%s, swallowed: %t: no COMMIT may follow", name, swallow)
 		}
 	}
 }
