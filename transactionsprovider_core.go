@@ -314,7 +314,6 @@ func (t *transactionsProviderCore) Run(logicFn AttemptFunc, perConfig *Transacti
 					ShouldNotRollback: false,
 					Reason:            gocbcore.TransactionErrorReasonTransactionFailed,
 					ErrorCause:        lambdaErr,
-					ShouldNotCommit:   true,
 				}, &attempt)
 			}
 		}

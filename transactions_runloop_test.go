@@ -72,7 +72,6 @@ func retryableFailure(ctx *TransactionAttemptContext) error {
 	return operationFailed(transactionOperationFailedDef{
 		ShouldNotRetry:    false,
 		ShouldNotRollback: false,
-		ShouldNotCommit:   true,
 		Reason:            gocbcore.TransactionErrorReasonTransactionFailed,
 		ErrorCause:        errTxnTest,
 	}, ctx)

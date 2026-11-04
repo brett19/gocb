@@ -121,7 +121,6 @@ func (c *TransactionAttemptContext) replaceQueryMode(doc *TransactionGetResult, 
 			Reason:            gocbcore.TransactionErrorReasonTransactionFailed,
 			ErrorCause:        wrapError(ErrFeatureNotAvailable, "expiry is not available for queries"),
 			ErrorClass:        gocbcore.TransactionErrorClassFailOther,
-			ShouldNotCommit:   true,
 		}, c)
 	}
 
@@ -132,7 +131,7 @@ func (c *TransactionAttemptContext) replaceQueryMode(doc *TransactionGetResult, 
 
 	valueBytes, flags, err := transcoder.Encode(value)
 	if err != nil {
-		return nil, createTransactionOperationFailedError(err)
+		return nil, operationFailedFromError(err, c)
 	}
 
 	userFlags, _ := gocbcore.DecodeCommonFlags(flags)
@@ -143,7 +142,6 @@ func (c *TransactionAttemptContext) replaceQueryMode(doc *TransactionGetResult, 
 			Reason:            gocbcore.TransactionErrorReasonTransactionFailed,
 			ErrorCause:        wrapError(ErrFeatureNotAvailable, "binary transactions is not available for queries"),
 			ErrorClass:        gocbcore.TransactionErrorClassFailOther,
-			ShouldNotCommit:   true,
 		}, c)
 	}
 
@@ -169,25 +167,22 @@ func (c *TransactionAttemptContext) replaceQueryMode(doc *TransactionGetResult, 
 
 		if errors.Is(err, ErrDocumentNotFound) {
 			return operationFailed(transactionOperationFailedDef{
-				ErrorCause:      err,
-				Reason:          gocbcore.TransactionErrorReasonTransactionFailed,
-				ShouldNotCommit: true,
-				ErrorClass:      gocbcore.TransactionErrorClassFailDocNotFound,
+				ErrorCause: err,
+				Reason:     gocbcore.TransactionErrorReasonTransactionFailed,
+				ErrorClass: gocbcore.TransactionErrorClassFailDocNotFound,
 			}, c)
 		} else if errors.Is(err, ErrCasMismatch) {
 			return operationFailed(transactionOperationFailedDef{
-				ErrorCause:      err,
-				Reason:          gocbcore.TransactionErrorReasonTransactionFailed,
-				ShouldNotCommit: true,
-				ErrorClass:      gocbcore.TransactionErrorClassFailCasMismatch,
+				ErrorCause: err,
+				Reason:     gocbcore.TransactionErrorReasonTransactionFailed,
+				ErrorClass: gocbcore.TransactionErrorClassFailCasMismatch,
 			}, c)
 		}
 
 		return operationFailed(transactionOperationFailedDef{
-			ShouldNotRetry:  true,
-			ErrorCause:      err,
-			Reason:          gocbcore.TransactionErrorReasonTransactionFailed,
-			ShouldNotCommit: true,
+			ShouldNotRetry: true,
+			ErrorCause:     err,
+			Reason:         gocbcore.TransactionErrorReasonTransactionFailed,
 		}, c)
 	}
 
@@ -246,7 +241,6 @@ func (c *TransactionAttemptContext) insertQueryMode(collection *Collection, id s
 			Reason:            gocbcore.TransactionErrorReasonTransactionFailed,
 			ErrorCause:        wrapError(ErrFeatureNotAvailable, "expiry is not available for queries"),
 			ErrorClass:        gocbcore.TransactionErrorClassFailOther,
-			ShouldNotCommit:   true,
 		}, c)
 	}
 
@@ -257,7 +251,7 @@ func (c *TransactionAttemptContext) insertQueryMode(collection *Collection, id s
 
 	valueBytes, flags, err := transcoder.Encode(value)
 	if err != nil {
-		return nil, createTransactionOperationFailedError(err)
+		return nil, operationFailedFromError(err, c)
 	}
 
 	userFlags, _ := gocbcore.DecodeCommonFlags(flags)
@@ -270,8 +264,7 @@ func (c *TransactionAttemptContext) insertQueryMode(collection *Collection, id s
 				ErrFeatureNotAvailable,
 				"binary transactions is not available for queries",
 			),
-			ErrorClass:      gocbcore.TransactionErrorClassFailOther,
-			ShouldNotCommit: true,
+			ErrorClass: gocbcore.TransactionErrorClassFailOther,
 		}, c)
 	}
 
@@ -281,9 +274,7 @@ func (c *TransactionAttemptContext) insertQueryMode(collection *Collection, id s
 
 	b, err := json.Marshal(txdata)
 	if err != nil {
-		return nil, &TransactionOperationFailedError{
-			errorCause: err,
-		}
+		return nil, operationFailedFromError(err, c)
 	}
 
 	handleErr := func(err error) error {
@@ -296,10 +287,9 @@ func (c *TransactionAttemptContext) insertQueryMode(collection *Collection, id s
 		}
 
 		return operationFailed(transactionOperationFailedDef{
-			ShouldNotRetry:  true,
-			ErrorCause:      err,
-			Reason:          gocbcore.TransactionErrorReasonTransactionFailed,
-			ShouldNotCommit: true,
+			ShouldNotRetry: true,
+			ErrorCause:     err,
+			Reason:         gocbcore.TransactionErrorReasonTransactionFailed,
 		}, c)
 	}
 
@@ -371,25 +361,22 @@ func (c *TransactionAttemptContext) removeQueryMode(doc *TransactionGetResult) e
 
 		if errors.Is(err, ErrDocumentNotFound) {
 			return operationFailed(transactionOperationFailedDef{
-				ErrorCause:      err,
-				Reason:          gocbcore.TransactionErrorReasonTransactionFailed,
-				ShouldNotCommit: true,
-				ErrorClass:      gocbcore.TransactionErrorClassFailDocNotFound,
+				ErrorCause: err,
+				Reason:     gocbcore.TransactionErrorReasonTransactionFailed,
+				ErrorClass: gocbcore.TransactionErrorClassFailDocNotFound,
 			}, c)
 		} else if errors.Is(err, ErrCasMismatch) {
 			return operationFailed(transactionOperationFailedDef{
-				ErrorCause:      err,
-				Reason:          gocbcore.TransactionErrorReasonTransactionFailed,
-				ShouldNotCommit: true,
-				ErrorClass:      gocbcore.TransactionErrorClassFailCasMismatch,
+				ErrorCause: err,
+				Reason:     gocbcore.TransactionErrorReasonTransactionFailed,
+				ErrorClass: gocbcore.TransactionErrorClassFailCasMismatch,
 			}, c)
 		}
 
 		return operationFailed(transactionOperationFailedDef{
-			ShouldNotRetry:  true,
-			ErrorCause:      err,
-			Reason:          gocbcore.TransactionErrorReasonTransactionFailed,
-			ShouldNotCommit: true,
+			ShouldNotRetry: true,
+			ErrorCause:     err,
+			Reason:         gocbcore.TransactionErrorReasonTransactionFailed,
 		}, c)
 	}
 
@@ -468,7 +455,6 @@ func (c *TransactionAttemptContext) rollbackQueryMode() error {
 			ShouldNotRollback: true,
 			ErrorCause:        err,
 			Reason:            gocbcore.TransactionErrorReasonTransactionFailed,
-			ShouldNotCommit:   true,
 		}, c)
 	}
 
@@ -564,9 +550,8 @@ func (c *TransactionAttemptContext) queryWrapperWrapper(scope *Scope, statement 
 
 	if meta.Status == QueryStatusFatal {
 		return nil, operationFailed(transactionOperationFailedDef{
-			ShouldNotRetry:  true,
-			Reason:          gocbcore.TransactionErrorReasonTransactionFailed,
-			ShouldNotCommit: true,
+			ShouldNotRetry: true,
+			Reason:         gocbcore.TransactionErrorReasonTransactionFailed,
 		}, c)
 	}
 
@@ -626,9 +611,12 @@ func (c *TransactionAttemptContext) queryWrapper(scope *Scope, statement string,
 	expired, err := c.hooks.HasExpiredClientSideHook(*c, hookPoint, statement)
 	if err != nil {
 		// This isn't meant to happen...
-		return nil, &TransactionOperationFailedError{
-			errorCause: err,
-		}
+		return nil, operationFailed(transactionOperationFailedDef{
+			ShouldNotRetry: true,
+			Reason:         gocbcore.TransactionErrorReasonTransactionFailed,
+			ErrorCause:     err,
+			ErrorClass:     gocbcore.TransactionErrorClassFailOther,
+		}, c)
 	}
 	cfg := c.txn.Config()
 	if cfg.ExpirationTime < 10*time.Millisecond || expired {
@@ -713,7 +701,6 @@ func (c *TransactionAttemptContext) queryBeginWork(scope *Scope) (errOut error) 
 				Reason:            gocbcore.TransactionErrorReasonTransactionFailed,
 				ErrorCause:        wrapError(ErrFeatureNotAvailable, "expiry is not available for queries"),
 				ErrorClass:        gocbcore.TransactionErrorClassFailOther,
-				ShouldNotCommit:   true,
 			}, c)
 		}
 
@@ -727,8 +714,7 @@ func (c *TransactionAttemptContext) queryBeginWork(scope *Scope) (errOut error) 
 					ErrFeatureNotAvailable,
 					"binary transactions is not available for queries",
 				),
-				ErrorClass:      gocbcore.TransactionErrorClassFailOther,
-				ShouldNotCommit: true,
+				ErrorClass: gocbcore.TransactionErrorClassFailOther,
 			}, c)
 		}
 	}

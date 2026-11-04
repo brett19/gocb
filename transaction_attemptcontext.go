@@ -143,7 +143,6 @@ func (c *TransactionAttemptContext) GetReplicaFromPreferredServerGroupWithOption
 		return nil, operationFailed(transactionOperationFailedDef{
 			ShouldNotRollback: false,
 			ShouldNotRetry:    true,
-			ShouldNotCommit:   true,
 			Reason:            gocbcore.TransactionErrorReasonTransactionFailed,
 			ErrorCause:        errors.New("PreferredServerGroup must have previously been set in ClusterOptions"),
 		}, c)
@@ -160,8 +159,7 @@ func (c *TransactionAttemptContext) GetReplicaFromPreferredServerGroupWithOption
 				ErrFeatureNotAvailable,
 				"the GetReplicaFromPreferredServerGroup operation is not available for queries",
 			),
-			ErrorClass:      gocbcore.TransactionErrorClassFailOther,
-			ShouldNotCommit: true,
+			ErrorClass: gocbcore.TransactionErrorClassFailOther,
 		}, c)
 	}
 	c.queryStateLock.Unlock()
@@ -180,7 +178,7 @@ func (c *TransactionAttemptContext) get(collection *Collection, id string, serve
 
 	a, err := collection.Bucket().Internal().IORouter()
 	if err != nil {
-		return nil, createTransactionOperationFailedError(err)
+		return nil, operationFailedFromError(err, c)
 	}
 
 	waitCh := make(chan struct{}, 1)
@@ -218,7 +216,7 @@ func (c *TransactionAttemptContext) get(collection *Collection, id string, serve
 	})
 	if err != nil {
 		resOut = nil
-		errOut = createTransactionOperationFailedError(err)
+		errOut = operationFailedFromError(err, c)
 		return
 	}
 	<-waitCh
@@ -270,7 +268,7 @@ func (c *TransactionAttemptContext) replace(doc *TransactionGetResult, value int
 
 	valueBytes, flags, err := transcoder.Encode(value)
 	if err != nil {
-		return nil, createTransactionOperationFailedError(err)
+		return nil, operationFailedFromError(err, c)
 	}
 
 	collection := doc.collection
@@ -299,7 +297,7 @@ func (c *TransactionAttemptContext) replace(doc *TransactionGetResult, value int
 	})
 	if err != nil {
 		resOut = nil
-		errOut = createTransactionOperationFailedError(err)
+		errOut = operationFailedFromError(err, c)
 		return
 	}
 	<-waitCh
@@ -342,7 +340,7 @@ func (c *TransactionAttemptContext) insert(collection *Collection, id string, va
 
 	valueBytes, flags, err := transcoder.Encode(value)
 	if err != nil {
-		return nil, createTransactionOperationFailedError(err)
+		return nil, operationFailedFromError(err, c)
 	}
 
 	a, err := collection.Bucket().Internal().IORouter()
@@ -381,7 +379,7 @@ func (c *TransactionAttemptContext) insert(collection *Collection, id string, va
 	})
 	if err != nil {
 		resOut = nil
-		errOut = createTransactionOperationFailedError(err)
+		errOut = operationFailedFromError(err, c)
 		return
 	}
 	<-waitCh
@@ -421,7 +419,7 @@ func (c *TransactionAttemptContext) remove(doc *TransactionGetResult) (errOut er
 		waitCh <- struct{}{}
 	})
 	if err != nil {
-		errOut = createTransactionOperationFailedError(err)
+		errOut = operationFailedFromError(err, c)
 		return
 	}
 	<-waitCh
@@ -446,8 +444,7 @@ func (c *TransactionAttemptContext) BulkGet(specs []TransactionBulkGetSpec, opti
 				ErrFeatureNotAvailable,
 				"the BulkGet operation is not available in query mode",
 			),
-			ErrorClass:      gocbcore.TransactionErrorClassFailOther,
-			ShouldNotCommit: true,
+			ErrorClass: gocbcore.TransactionErrorClassFailOther,
 		}, c)
 	}
 	c.queryStateLock.Unlock()
@@ -467,7 +464,7 @@ func (c *TransactionAttemptContext) bulkGet(specs []TransactionBulkGetSpec, opti
 	for _, spec := range specs {
 		a, err := spec.Collection.Bucket().Internal().IORouter()
 		if err != nil {
-			return nil, createTransactionOperationFailedError(err)
+			return nil, operationFailedFromError(err, c)
 		}
 
 		coreOpts.Specs = append(coreOpts.Specs, gocbcore.TransactionGetMultiSpec{
@@ -490,7 +487,7 @@ func (c *TransactionAttemptContext) bulkGet(specs []TransactionBulkGetSpec, opti
 		waitCh <- struct{}{}
 	})
 	if err != nil {
-		errOut = createTransactionOperationFailedError(err)
+		errOut = operationFailedFromError(err, c)
 		return
 	}
 	<-waitCh
@@ -513,7 +510,6 @@ func (c *TransactionAttemptContext) BulkGetReplicaFromPreferredServerGroup(
 		return nil, operationFailed(transactionOperationFailedDef{
 			ShouldNotRollback: false,
 			ShouldNotRetry:    true,
-			ShouldNotCommit:   true,
 			Reason:            gocbcore.TransactionErrorReasonTransactionFailed,
 			ErrorCause:        errors.New("PreferredServerGroup must have previously been set in ClusterOptions"),
 		}, c)
@@ -530,8 +526,7 @@ func (c *TransactionAttemptContext) BulkGetReplicaFromPreferredServerGroup(
 				ErrFeatureNotAvailable,
 				"the BulkGetReplicaFromPreferredServerGroup operation is not available in query mode",
 			),
-			ErrorClass:      gocbcore.TransactionErrorClassFailOther,
-			ShouldNotCommit: true,
+			ErrorClass: gocbcore.TransactionErrorClassFailOther,
 		}, c)
 	}
 	c.queryStateLock.Unlock()
@@ -555,7 +550,7 @@ func (c *TransactionAttemptContext) bulkGetReplicaFromPreferredServerGroup(
 	for _, spec := range specs {
 		a, err := spec.Collection.Bucket().Internal().IORouter()
 		if err != nil {
-			return nil, createTransactionOperationFailedError(err)
+			return nil, operationFailedFromError(err, c)
 		}
 
 		coreOpts.Specs = append(coreOpts.Specs, gocbcore.TransactionGetMultiSpec{
@@ -578,7 +573,7 @@ func (c *TransactionAttemptContext) bulkGetReplicaFromPreferredServerGroup(
 		waitCh <- struct{}{}
 	})
 	if err != nil {
-		errOut = createTransactionOperationFailedError(err)
+		errOut = operationFailedFromError(err, c)
 		return
 	}
 	<-waitCh

@@ -69,9 +69,8 @@ func (t *Transactions) singleQuery(statement string, scope *Scope, opts QueryOpt
 
 			if meta.Status == QueryStatusFatal {
 				return operationFailed(transactionOperationFailedDef{
-					ShouldNotRetry:  true,
-					Reason:          gocbcore.TransactionErrorReasonTransactionFailed,
-					ShouldNotCommit: true,
+					ShouldNotRetry: true,
+					Reason:         gocbcore.TransactionErrorReasonTransactionFailed,
 				}, context)
 			}
 

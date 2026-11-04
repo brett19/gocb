@@ -204,6 +204,33 @@ func createTransactionOperationFailedError(err error) error {
 	}
 }
 
+// operationFailedFromError converts err, returned by a transaction operation, into a TransactionOperationFailedError.
+//
+// A TransactionOperationFailedError from gocbcore has already set the attempt's state. Any other error comes from gocb
+// itself, for example when a value cannot be encoded, and fails the transaction like any other error that is not a
+// TransactionOperationFailed (transactions-design-doc.md, Exceptions Raised by the Application Lambda): it raises
+// FAILED and sets the attempt's state, which leaves the attempt unable to commit.
+//
+// This is for operations within the lambda. Errors from commit and rollback use createTransactionOperationFailedError,
+// which does not change the attempt's state.
+func operationFailedFromError(err error, c *TransactionAttemptContext) error {
+	if err == nil {
+		return nil
+	}
+
+	var txnErr *gocbcore.TransactionOperationFailedError
+	if errors.As(err, &txnErr) {
+		return createTransactionOperationFailedError(err)
+	}
+
+	return operationFailed(transactionOperationFailedDef{
+		ShouldNotRetry: true,
+		Reason:         gocbcore.TransactionErrorReasonTransactionFailed,
+		ErrorCause:     err,
+		ErrorClass:     gocbcore.TransactionErrorClassFailOther,
+	}, c)
+}
+
 func errorReasonFromString(reason string) gocbcore.TransactionErrorReason {
 	switch reason {
 	case "failed":

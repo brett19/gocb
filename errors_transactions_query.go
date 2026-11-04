@@ -64,7 +64,6 @@ func queryCauseToOperationFailedError(queryErr *QueryError, c *TransactionAttemp
 					ShouldNotRollback: !operationFailedErr.Cause.Rollback,
 					Reason:            errorReasonFromString(operationFailedErr.Cause.Raise),
 					ErrorCause:        queryErr,
-					ShouldNotCommit:   true,
 				}, c)
 			}
 		}
@@ -168,7 +167,6 @@ func queryMaybeTranslateCommitStatementError(err error, c *TransactionAttemptCon
 		return operationFailed(transactionOperationFailedDef{
 			ShouldNotRetry:    true,
 			ShouldNotRollback: true,
-			ShouldNotCommit:   true,
 			Reason:            gocbcore.TransactionErrorReasonTransactionCommitAmbiguous,
 			ErrorCause:        err,
 			ErrorClass:        gocbcore.TransactionErrorClassFailAmbiguous,
@@ -184,16 +182,17 @@ type transactionOperationFailedDef struct {
 	Reason            gocbcore.TransactionErrorReason
 	ErrorCause        error
 	ErrorClass        gocbcore.TransactionErrorClass
-	ShouldNotCommit   bool
 }
 
+// operationFailed creates a TransactionOperationFailedError from def and, if c is not nil, sets the attempt's state
+// from it.
+//
+// Every TransactionOperationFailedError fails the transaction, so the attempt can no longer be committed: whatever
+// else the error allows (rolling back, or retrying), the Run loop must not go on to send COMMIT after it. The spec
+// requires this of every TransactionOperationFailed (transactions-design-doc.md, ExtThreadSafety: "sb =
+// COMMIT_NOT_ALLOWED"). Errors that must leave the transaction committable, such as the query errors that statement
+// level atomicity returns to the lambda, are returned as plain errors and never pass through here.
 func operationFailed(def transactionOperationFailedDef, c *TransactionAttemptContext) *TransactionOperationFailedError {
-	// An expired transaction can never be committed. Whatever else the error allows (rolling back, for example), the
-	// Run loop must not go on to send COMMIT after it.
-	if def.Reason == gocbcore.TransactionErrorReasonTransactionExpired {
-		def.ShouldNotCommit = true
-	}
-
 	err := &TransactionOperationFailedError{
 		shouldRetry:       !def.ShouldNotRetry,
 		shouldNotRollback: def.ShouldNotRollback,
@@ -203,23 +202,22 @@ func operationFailed(def transactionOperationFailedDef, c *TransactionAttemptCon
 	}
 
 	if c != nil {
-		c.logger.logInfof(c.attemptID, "Operation failed: can still commit: %t, should not rollback: %t, should not retry: %t, "+
-			"reason: %s", !def.ShouldNotCommit, def.ShouldNotRollback, def.ShouldNotRetry, def.Reason)
+		c.logger.logInfof(c.attemptID, "Operation failed: should not rollback: %t, should not retry: %t, reason: %s",
+			def.ShouldNotRollback, def.ShouldNotRetry, def.Reason)
 		c.updateState(def)
 	}
 	return err
 }
 
 func (c *TransactionAttemptContext) updateState(def transactionOperationFailedDef) {
-	opts := gocbcore.TransactionUpdateStateOptions{}
+	opts := gocbcore.TransactionUpdateStateOptions{
+		ShouldNotCommit: true,
+	}
 	if def.ShouldNotRollback {
 		opts.ShouldNotRollback = true
 	}
 	if def.ShouldNotRetry {
 		opts.ShouldNotRetry = true
-	}
-	if def.ShouldNotCommit {
-		opts.ShouldNotCommit = true
 	}
 	opts.Reason = def.Reason
 	c.txn.UpdateState(opts)

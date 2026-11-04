@@ -376,3 +376,277 @@ func (suite *UnitTestSuite) TestSingleQueryDefiniteExpiryIsUnambiguousTimeout() 
 	})
 	suite.Assert().ErrorIs(err, ErrUnambiguousTimeout)
 }
+
+// runQueryModeLambda runs a query mode transaction with the given lambda, answering the UPDATE statement with stmtErr,
+// and returns the statements sent and the error from the transaction.
+func (suite *UnitTestSuite) runQueryModeLambda(stmtErr error, hooks TransactionHooks,
+	fn func(ctx *TransactionAttemptContext) error) ([]string, error) {
+	provider := &txnQueryTestProvider{suite: suite}
+	provider.fn = func(statement string) (*QueryResult, error) {
+		if statement == "UPDATE `default` SET foo = 1" && stmtErr != nil {
+			return nil, stmtErr
+		}
+		return nil, nil
+	}
+	txns, _ := suite.newQueryTestTransactions(provider)
+	defer txns.close()
+
+	_, err := txns.Run(fn, txnTestOptions(30*time.Second, hooks), false)
+
+	return provider.sent(), err
+}
+
+// The query errors which gocb raises as a TransactionOperationFailedError that fails the transaction, other than those
+// raising EXPIRED (see TestQueryExpiredTranslationsPreventCommit), with what the Run loop should send after them.
+func queryTestFailingErrors() map[string]struct {
+	err         error
+	reason      gocbcore.TransactionErrorReason
+	rollback    bool
+	errorAsType error
+} {
+	return map[string]struct {
+		err         error
+		reason      gocbcore.TransactionErrorReason
+		rollback    bool
+		errorAsType error
+	}{
+		"1065 feature not available": {
+			err:         &QueryError{Statement: "UPDATE", Errors: []QueryErrorDesc{{Code: 1065}}},
+			reason:      gocbcore.TransactionErrorReasonTransactionFailed,
+			rollback:    true,
+			errorAsType: &TransactionFailedError{},
+		},
+		"cause raises failed": {
+			err:         queryTestCauseError(17007, true, false, "failed"),
+			reason:      gocbcore.TransactionErrorReasonTransactionFailed,
+			rollback:    true,
+			errorAsType: &TransactionFailedError{},
+		},
+		"cause raises commit_ambiguous": {
+			err:         queryTestCauseError(17007, false, false, "commit_ambiguous"),
+			reason:      gocbcore.TransactionErrorReasonTransactionCommitAmbiguous,
+			rollback:    false,
+			errorAsType: &TransactionCommitAmbiguousError{},
+		},
+		"cause raises failed_post_commit": {
+			err:      queryTestCauseError(17007, false, false, "failed_post_commit"),
+			reason:   gocbcore.TransactionErrorReasonTransactionFailedPostCommit,
+			rollback: false,
+		},
+	}
+}
+
+// Every query error that gocb raises as a TransactionOperationFailedError leaves the attempt unable to commit, whatever
+// it raises: per the spec (transactions-design-doc.md, ExtThreadSafety) every TransactionOperationFailed sets
+// COMMIT_NOT_ALLOWED.
+func (suite *UnitTestSuite) TestQueryFailingTranslationsPreventCommit() {
+	for name, tc := range queryTestFailingErrors() {
+		txns := suite.newTxnTestTransactions()
+		_, _ = txns.Run(func(ctx *TransactionAttemptContext) error {
+			translated := queryMaybeTranslateToTransactionsError(tc.err, ctx)
+
+			var tErr *TransactionOperationFailedError
+			suite.Require().ErrorAs(translated, &tErr, name)
+			suite.Assert().Equal(tc.reason, tErr.shouldRaise, name)
+			suite.Assert().False(ctx.canCommit(), "%s: a failed attempt may not be committed", name)
+			return nil
+		}, txnTestOptions(30*time.Second, nil), false)
+		suite.Require().NoError(txns.close())
+	}
+}
+
+// A statement that fails with an error which fails the transaction is never followed by COMMIT, whether the lambda
+// returns the error or swallows it. If the error allows rollback, a ROLLBACK follows instead.
+func (suite *UnitTestSuite) TestQueryModeFailingStatementDoesNotCommit() {
+	for name, tc := range queryTestFailingErrors() {
+		for _, swallow := range []bool{false, true} {
+			sent, err := suite.runQueryModeLambda(tc.err, nil, func(ctx *TransactionAttemptContext) error {
+				_, err := ctx.Query("UPDATE `default` SET foo = 1", nil)
+				suite.Assert().Error(err, "%s, swallowed: %t", name, swallow)
+				if swallow {
+					return nil
+				}
+				return err
+			})
+
+			expected := []string{"BEGIN WORK", "UPDATE `default` SET foo = 1"}
+			if tc.rollback {
+				expected = append(expected, "ROLLBACK")
+			}
+			suite.Assert().Equal(expected, sent, "%s, swallowed: %t: no COMMIT may follow", name, swallow)
+			if tc.errorAsType != nil {
+				suite.Assert().IsType(tc.errorAsType, err, "%s, swallowed: %t", name, swallow)
+			}
+		}
+	}
+}
+
+// 1065 is translated to FeatureNotAvailable, and is the cause of the TransactionFailedError.
+func (suite *UnitTestSuite) TestQueryModeFeatureNotAvailableFailsTransaction() {
+	for _, inStream := range []bool{false, true} {
+		sent, err := suite.runQueryModeStatement(func(p *txnQueryTestProvider) (*QueryResult, error) {
+			featureErr := &QueryError{Statement: "UPDATE", Errors: []QueryErrorDesc{{Code: 1065}}}
+			if inStream {
+				return p.streamErr(featureErr), nil
+			}
+			return nil, featureErr
+		}, nil)
+
+		var failedErr *TransactionFailedError
+		suite.Assert().ErrorAs(err, &failedErr, "in stream: %t", inStream)
+		suite.Assert().ErrorIs(err, ErrFeatureNotAvailable, "in stream: %t", inStream)
+		suite.Assert().Equal([]string{"BEGIN WORK", "UPDATE `default` SET foo = 1", "ROLLBACK"}, sent,
+			"in stream: %t: no COMMIT may follow", inStream)
+	}
+}
+
+// A failing HasExpiredClientSideHook fails the statement, and the transaction with it.
+func (suite *UnitTestSuite) TestQueryModeHookErrorDoesNotCommit() {
+	for _, swallow := range []bool{false, true} {
+		hooks := &txnTestHooks{fn: func(stage string) (bool, error) {
+			if stage == "query" {
+				return false, errTxnTest
+			}
+			return false, nil
+		}}
+		sent, err := suite.runQueryModeLambda(nil, hooks, func(ctx *TransactionAttemptContext) error {
+			_, err := ctx.Query("UPDATE `default` SET foo = 1", nil)
+			suite.Assert().Error(err, "swallowed: %t", swallow)
+			if swallow {
+				return nil
+			}
+			return err
+		})
+
+		var failedErr *TransactionFailedError
+		suite.Assert().ErrorAs(err, &failedErr, "swallowed: %t", swallow)
+		suite.Assert().Equal([]string{"BEGIN WORK", "ROLLBACK"}, sent, "swallowed: %t: no COMMIT may follow", swallow)
+	}
+}
+
+// Query errors that the spec returns to the lambda as plain errors (statement level atomicity) do not fail the
+// transaction: if the lambda handles them, the transaction still commits. If it returns them, the Run loop fails the
+// transaction, as for any other error from the lambda.
+func (suite *UnitTestSuite) TestQueryModeBenignErrorsStillCommit() {
+	benignErrs := map[string]error{
+		"syntax error":     &QueryError{Statement: "UPDATE", Errors: []QueryErrorDesc{{Code: 3000}}},
+		"unknown keyspace": &QueryError{Statement: "UPDATE", Errors: []QueryErrorDesc{{Code: 12003}}},
+		"no error codes":   &QueryError{Statement: "UPDATE", InnerError: ErrParsingFailure},
+		"17012":            &QueryError{Statement: "UPDATE", Errors: []QueryErrorDesc{{Code: 17012}}},
+		"17014":            &QueryError{Statement: "UPDATE", Errors: []QueryErrorDesc{{Code: 17014}}},
+		"17015":            &QueryError{Statement: "UPDATE", Errors: []QueryErrorDesc{{Code: 17015}}},
+	}
+	for name, benignErr := range benignErrs {
+		for _, swallow := range []bool{false, true} {
+			sent, err := suite.runQueryModeLambda(benignErr, nil, func(ctx *TransactionAttemptContext) error {
+				_, err := ctx.Query("UPDATE `default` SET foo = 1", nil)
+				suite.Require().Error(err, name)
+
+				var tErr *TransactionOperationFailedError
+				suite.Assert().False(errors.As(err, &tErr), "%s: must be a plain error", name)
+				suite.Assert().True(ctx.canCommit(), "%s: must leave the attempt committable", name)
+				if swallow {
+					return nil
+				}
+				return err
+			})
+
+			if swallow {
+				suite.Assert().NoError(err, name)
+				suite.Assert().Equal([]string{"BEGIN WORK", "UPDATE `default` SET foo = 1", "COMMIT"}, sent, name)
+			} else {
+				var failedErr *TransactionFailedError
+				suite.Assert().ErrorAs(err, &failedErr, name)
+				suite.Assert().Equal([]string{"BEGIN WORK", "UPDATE `default` SET foo = 1", "ROLLBACK"}, sent, name)
+			}
+		}
+	}
+}
+
+type txnFailingTranscoder struct {
+	JSONTranscoder
+}
+
+var errTxnTestEncode = errors.New("test encode failure")
+
+func (t *txnFailingTranscoder) Encode(interface{}) ([]byte, uint32, error) {
+	return nil, 0, errTxnTestEncode
+}
+
+// assertOperationFailedWith asserts that err is a TransactionOperationFailedError caused by cause.
+func (suite *UnitTestSuite) assertOperationFailedWith(err, cause error, msgAndArgs ...interface{}) {
+	var tErr *TransactionOperationFailedError
+	if suite.Assert().ErrorAs(err, &tErr, msgAndArgs...) {
+		suite.Assert().ErrorIs(tErr.InternalUnwrap(), cause, msgAndArgs...)
+		suite.Assert().Equal(gocbcore.TransactionErrorReasonTransactionFailed, tErr.shouldRaise, msgAndArgs...)
+	}
+}
+
+// A query mode insert whose value cannot be encoded fails the transaction, so no COMMIT follows.
+func (suite *UnitTestSuite) TestQueryModeEncodeFailureDoesNotCommit() {
+	collection := newBucket("default", nil, nil).DefaultCollection()
+	for _, swallow := range []bool{false, true} {
+		sent, err := suite.runQueryModeLambda(nil, nil, func(ctx *TransactionAttemptContext) error {
+			_, err := ctx.Query("UPDATE `default` SET foo = 1", nil)
+			suite.Require().NoError(err)
+
+			_, err = ctx.InsertWithOptions(collection, "id", "value", &TransactionInsertOptions{
+				Transcoder: &txnFailingTranscoder{},
+			})
+			suite.assertOperationFailedWith(err, errTxnTestEncode, "swallowed: %t", swallow)
+			if swallow {
+				return nil
+			}
+			return err
+		})
+
+		var failedErr *TransactionFailedError
+		suite.Assert().ErrorAs(err, &failedErr, "swallowed: %t", swallow)
+		if !swallow {
+			suite.Assert().ErrorIs(err, errTxnTestEncode)
+		}
+		suite.Assert().Equal([]string{"BEGIN WORK", "UPDATE `default` SET foo = 1", "ROLLBACK"}, sent,
+			"swallowed: %t: no COMMIT may follow", swallow)
+	}
+}
+
+// The same applies in KV mode: gocb, not gocbcore, raises the error when a value cannot be encoded, and it must fail
+// the transaction rather than let it commit.
+func (suite *UnitTestSuite) TestKVModeEncodeFailureDoesNotCommit() {
+	collection := newBucket("default", nil, nil).DefaultCollection()
+	ops := map[string]func(ctx *TransactionAttemptContext) error{
+		"insert": func(ctx *TransactionAttemptContext) error {
+			_, err := ctx.InsertWithOptions(collection, "id", "value", &TransactionInsertOptions{
+				Transcoder: &txnFailingTranscoder{},
+			})
+			return err
+		},
+		"replace": func(ctx *TransactionAttemptContext) error {
+			_, err := ctx.ReplaceWithOptions(&TransactionGetResult{collection: collection, docID: "id"}, "value",
+				&TransactionReplaceOptions{Transcoder: &txnFailingTranscoder{}})
+			return err
+		},
+	}
+	for name, op := range ops {
+		for _, swallow := range []bool{false, true} {
+			txns := suite.newTxnTestTransactions()
+			_, err := txns.Run(func(ctx *TransactionAttemptContext) error {
+				err := op(ctx)
+				suite.assertOperationFailedWith(err, errTxnTestEncode, "%s, swallowed: %t", name, swallow)
+				suite.Assert().False(ctx.canCommit(), "%s, swallowed: %t: a failed attempt may not be committed",
+					name, swallow)
+				if swallow {
+					return nil
+				}
+				return err
+			}, txnTestOptions(30*time.Second, nil), false)
+
+			var failedErr *TransactionFailedError
+			suite.Assert().ErrorAs(err, &failedErr, "%s, swallowed: %t", name, swallow)
+			if !swallow {
+				suite.Assert().ErrorIs(err, errTxnTestEncode, name)
+			}
+			suite.Require().NoError(txns.close())
+		}
+	}
+}
