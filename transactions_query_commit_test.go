@@ -984,3 +984,45 @@ func (suite *UnitTestSuite) TestQueryModeTxDataEncodeFailureDoesNotCommit() {
 		}
 	}
 }
+
+// The first query statement waits for a KV operation already under way before it sends BEGIN WORK, so that the
+// operation cannot stage a mutation after the attempt has been handed to the query service. KV operations hold the
+// query state lock for reading while they run; here the test holds it as a KV operation would.
+func (suite *UnitTestSuite) TestQueryModeBeginWorkWaitsForKVOperations() {
+	provider := &txnQueryTestProvider{suite: suite}
+	txns, _ := suite.newQueryTestTransactions(provider)
+	defer txns.close()
+
+	_, err := txns.Run(func(ctx *TransactionAttemptContext) error {
+		suite.Require().False(ctx.lockQueryStateForOperation(), "not yet in query mode")
+
+		queryDone := make(chan error, 1)
+		go func() {
+			_, err := ctx.Query("SELECT 1", nil)
+			queryDone <- err
+		}()
+
+		select {
+		case <-queryDone:
+			suite.Fail("the query completed while a KV operation was under way")
+		case <-time.After(100 * time.Millisecond):
+		}
+		suite.Assert().Empty(provider.sent(), "BEGIN WORK must wait for the KV operation")
+
+		ctx.queryStateLock.RUnlock()
+		select {
+		case err := <-queryDone:
+			suite.Require().NoError(err)
+		case <-time.After(5 * time.Second):
+			suite.FailNow("the query did not complete once the KV operation finished")
+		}
+		suite.Assert().Equal([]string{"BEGIN WORK", "SELECT 1"}, provider.sent())
+
+		// Once in query mode, operations hold the lock exclusively.
+		suite.Require().True(ctx.lockQueryStateForOperation(), "now in query mode")
+		ctx.queryStateLock.Unlock()
+		return nil
+	}, txnTestOptions(30*time.Second, nil), false)
+	suite.Require().NoError(err)
+	suite.Assert().Equal([]string{"BEGIN WORK", "SELECT 1", "COMMIT"}, provider.sent())
+}

@@ -289,7 +289,7 @@ func (t *transactionsProviderCore) Run(logicFn AttemptFunc, perConfig *Transacti
 			transcoder:     t.transcoder,
 			hooks:          hooksWrapper.Hooks(),
 			cluster:        t.cluster,
-			queryStateLock: new(sync.Mutex),
+			queryStateLock: new(sync.RWMutex),
 			queryConfig: TransactionQueryOptions{
 				ScanConsistency: scanConsistency,
 			},

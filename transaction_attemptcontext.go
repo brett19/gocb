@@ -43,7 +43,7 @@ type TransactionAttemptContext struct {
 	// State applicable to when we move into query mode
 	queryState *transactionQueryState
 	// Pointer to satisfy go vet complaining about the hooks.
-	queryStateLock *sync.Mutex
+	queryStateLock *sync.RWMutex
 	queryConfig    TransactionQueryOptions
 	logger         *transactionLogger
 	attemptID      string
@@ -99,14 +99,41 @@ func (c *TransactionAttemptContext) Get(collection *Collection, id string) (*Tra
 	return c.GetWithOptions(collection, id, nil)
 }
 
+// lockQueryStateForOperation locks the query state for an operation on the attempt (get, insert, replace, remove,
+// and their bulk and replica forms). If the attempt is in query mode it returns true, with queryStateLock held
+// exclusively: query mode operations send their statements one at a time. Otherwise it returns false with
+// queryStateLock held for reading, and the caller must hold it until its KV operation has finished. KV operations
+// therefore still run in parallel with each other, but the first query statement, which holds the lock exclusively
+// while it sends BEGIN WORK, waits for any KV operation already under way. Without this a KV operation that had
+// passed the query mode check could stage its mutation after the attempt had been handed to the query service, which
+// would then commit the transaction without it.
+//
+// Query mode is never left once entered, so an attempt seen in query mode under the read lock is still in query mode
+// once the exclusive lock is taken; the loop only guards against that changing.
+func (c *TransactionAttemptContext) lockQueryStateForOperation() bool {
+	for {
+		c.queryStateLock.RLock()
+		if !c.queryModeLocked() {
+			return false
+		}
+		c.queryStateLock.RUnlock()
+
+		c.queryStateLock.Lock()
+		if c.queryModeLocked() {
+			return true
+		}
+		// Not reachable while query mode is never left, but if it were, check again under the read lock.
+		c.queryStateLock.Unlock()
+	}
+}
+
 // GetWithOptions will attempt to fetch a document, and fail the transaction if it does not exist.
 func (c *TransactionAttemptContext) GetWithOptions(collection *Collection, id string, opts *TransactionGetOptions) (*TransactionGetResult, error) {
 	if opts == nil {
 		opts = &TransactionGetOptions{}
 	}
 
-	c.queryStateLock.Lock()
-	if c.queryModeLocked() {
+	if c.lockQueryStateForOperation() {
 		res, err := c.getQueryMode(collection, id)
 		if err != nil {
 			c.logger.logInfof(c.attemptID, "Query mode get failed")
@@ -119,7 +146,7 @@ func (c *TransactionAttemptContext) GetWithOptions(collection *Collection, id st
 		c.queryStateLock.Unlock()
 		return res, nil
 	}
-	c.queryStateLock.Unlock()
+	defer c.queryStateLock.RUnlock()
 
 	return c.get(collection, id, "", opts)
 }
@@ -148,8 +175,7 @@ func (c *TransactionAttemptContext) GetReplicaFromPreferredServerGroupWithOption
 		}, c)
 	}
 
-	c.queryStateLock.Lock()
-	if c.queryModeLocked() {
+	if c.lockQueryStateForOperation() {
 		c.queryStateLock.Unlock()
 		return nil, operationFailed(transactionOperationFailedDef{
 			ShouldNotRetry:    true,
@@ -162,7 +188,7 @@ func (c *TransactionAttemptContext) GetReplicaFromPreferredServerGroupWithOption
 			ErrorClass: gocbcore.TransactionErrorClassFailOther,
 		}, c)
 	}
-	c.queryStateLock.Unlock()
+	defer c.queryStateLock.RUnlock()
 
 	return c.get(collection, id, c.preferredServerGroup, &TransactionGetOptions{
 		Transcoder: opts.Transcoder,
@@ -235,8 +261,7 @@ func (c *TransactionAttemptContext) ReplaceWithOptions(doc *TransactionGetResult
 		opts = &TransactionReplaceOptions{}
 	}
 
-	c.queryStateLock.Lock()
-	if c.queryModeLocked() {
+	if c.lockQueryStateForOperation() {
 		res, err := c.replaceQueryMode(doc, value, opts)
 		c.queryStateLock.Unlock()
 		if err != nil {
@@ -246,7 +271,7 @@ func (c *TransactionAttemptContext) ReplaceWithOptions(doc *TransactionGetResult
 
 		return res, nil
 	}
-	c.queryStateLock.Unlock()
+	defer c.queryStateLock.RUnlock()
 
 	return c.replace(doc, value, opts)
 }
@@ -316,8 +341,7 @@ func (c *TransactionAttemptContext) InsertWithOptions(collection *Collection, id
 		opts = &TransactionInsertOptions{}
 	}
 
-	c.queryStateLock.Lock()
-	if c.queryModeLocked() {
+	if c.lockQueryStateForOperation() {
 		res, err := c.insertQueryMode(collection, id, value, opts)
 		c.queryStateLock.Unlock()
 		if err != nil {
@@ -327,7 +351,7 @@ func (c *TransactionAttemptContext) InsertWithOptions(collection *Collection, id
 
 		return res, nil
 	}
-	c.queryStateLock.Unlock()
+	defer c.queryStateLock.RUnlock()
 
 	return c.insert(collection, id, value, opts)
 }
@@ -394,8 +418,7 @@ func (c *TransactionAttemptContext) Remove(doc *TransactionGetResult) error {
 
 // RemoveWithOptions will delete a document.
 func (c *TransactionAttemptContext) RemoveWithOptions(doc *TransactionGetResult, _opts *TransactionRemoveOptions) error {
-	c.queryStateLock.Lock()
-	if c.queryModeLocked() {
+	if c.lockQueryStateForOperation() {
 		err := c.removeQueryMode(doc)
 		c.queryStateLock.Unlock()
 		if err != nil {
@@ -405,7 +428,7 @@ func (c *TransactionAttemptContext) RemoveWithOptions(doc *TransactionGetResult,
 
 		return nil
 	}
-	c.queryStateLock.Unlock()
+	defer c.queryStateLock.RUnlock()
 
 	return c.remove(doc)
 }
@@ -433,8 +456,7 @@ func (c *TransactionAttemptContext) BulkGet(specs []TransactionBulkGetSpec, opti
 		options = &TransactionBulkGetOptions{}
 	}
 
-	c.queryStateLock.Lock()
-	if c.queryModeLocked() {
+	if c.lockQueryStateForOperation() {
 		c.queryStateLock.Unlock()
 		return nil, operationFailed(transactionOperationFailedDef{
 			ShouldNotRetry:    true,
@@ -447,7 +469,7 @@ func (c *TransactionAttemptContext) BulkGet(specs []TransactionBulkGetSpec, opti
 			ErrorClass: gocbcore.TransactionErrorClassFailOther,
 		}, c)
 	}
-	c.queryStateLock.Unlock()
+	defer c.queryStateLock.RUnlock()
 
 	return c.bulkGet(specs, options)
 }
@@ -515,8 +537,7 @@ func (c *TransactionAttemptContext) BulkGetReplicaFromPreferredServerGroup(
 		}, c)
 	}
 
-	c.queryStateLock.Lock()
-	if c.queryModeLocked() {
+	if c.lockQueryStateForOperation() {
 		c.queryStateLock.Unlock()
 		return nil, operationFailed(transactionOperationFailedDef{
 			ShouldNotRetry:    true,
@@ -529,7 +550,7 @@ func (c *TransactionAttemptContext) BulkGetReplicaFromPreferredServerGroup(
 			ErrorClass: gocbcore.TransactionErrorClassFailOther,
 		}, c)
 	}
-	c.queryStateLock.Unlock()
+	defer c.queryStateLock.RUnlock()
 
 	return c.bulkGetReplicaFromPreferredServerGroup(specs, options)
 }
