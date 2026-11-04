@@ -230,11 +230,14 @@ func (suite *UnitTestSuite) TestQueryModeCommitDefiniteFailureKeepsMapping() {
 	suite.Assert().Equal([]string{"BEGIN WORK", "UPDATE `default` SET foo = 1", "COMMIT", "ROLLBACK"}, sent)
 }
 
-func (suite *UnitTestSuite) TestQueryModeStatementTimeoutIsStillExpired() {
+// runQueryModeStatement runs a query mode transaction whose lambda sends one UPDATE statement, answered by stmtErr, and
+// returns the statements sent and the error from the transaction.
+func (suite *UnitTestSuite) runQueryModeStatement(stmtErr func(p *txnQueryTestProvider) (*QueryResult, error),
+	hooks TransactionHooks) ([]string, error) {
 	provider := &txnQueryTestProvider{suite: suite}
 	provider.fn = func(statement string) (*QueryResult, error) {
-		if statement == "UPDATE `default` SET foo = 1" {
-			return nil, &TimeoutError{InnerError: ErrAmbiguousTimeout}
+		if statement == "UPDATE `default` SET foo = 1" && stmtErr != nil {
+			return stmtErr(provider)
 		}
 		return nil, nil
 	}
@@ -244,10 +247,93 @@ func (suite *UnitTestSuite) TestQueryModeStatementTimeoutIsStillExpired() {
 	_, err := txns.Run(func(ctx *TransactionAttemptContext) error {
 		_, err := ctx.Query("UPDATE `default` SET foo = 1", nil)
 		return err
-	}, txnTestOptions(30*time.Second, nil), false)
+	}, txnTestOptions(30*time.Second, hooks), false)
+
+	return provider.sent(), err
+}
+
+// A statement other than COMMIT that times out on the SDK side is expired. An expired transaction must never be
+// committed, so no COMMIT may follow; the timeout allows rollback, so a ROLLBACK is sent instead.
+func (suite *UnitTestSuite) TestQueryModeStatementTimeoutIsStillExpired() {
+	for _, inStream := range []bool{false, true} {
+		sent, err := suite.runQueryModeStatement(func(p *txnQueryTestProvider) (*QueryResult, error) {
+			timeoutErr := &TimeoutError{InnerError: ErrAmbiguousTimeout}
+			if inStream {
+				return p.streamErr(timeoutErr), nil
+			}
+			return nil, timeoutErr
+		}, nil)
+
+		var expiredErr *TransactionExpiredError
+		suite.Assert().ErrorAs(err, &expiredErr, "in stream: %t", inStream)
+		suite.Assert().NotContains(sent, "COMMIT", "in stream: %t: an expired transaction may not be committed", inStream)
+		suite.Assert().Equal([]string{"BEGIN WORK", "UPDATE `default` SET foo = 1", "ROLLBACK"}, sent,
+			"in stream: %t", inStream)
+	}
+}
+
+// The query service's own expiry errors (1080 and 17010) on a statement other than COMMIT are expired too, and do not
+// allow rollback, so neither COMMIT nor ROLLBACK may follow them.
+func (suite *UnitTestSuite) TestQueryModeStatementServerExpiryDoesNotCommit() {
+	expiryErrs := map[string]error{
+		"1080":                 &QueryError{Statement: "UPDATE", Errors: []QueryErrorDesc{{Code: 1080}}},
+		"17010":                &QueryError{Statement: "UPDATE", Errors: []QueryErrorDesc{{Code: 17010}}},
+		"17010 with a cause":   queryTestCauseError(17010, true, false, "failed"),
+		"cause raises expired": queryTestCauseError(17007, false, false, "expired"),
+	}
+	for name, expiryErr := range expiryErrs {
+		for _, inStream := range []bool{false, true} {
+			sent, err := suite.runQueryModeStatement(func(p *txnQueryTestProvider) (*QueryResult, error) {
+				if inStream {
+					return p.streamErr(expiryErr), nil
+				}
+				return nil, expiryErr
+			}, nil)
+
+			var expiredErr *TransactionExpiredError
+			suite.Assert().ErrorAs(err, &expiredErr, "%s, in stream: %t", name, inStream)
+			suite.Assert().Equal([]string{"BEGIN WORK", "UPDATE `default` SET foo = 1"}, sent,
+				"%s, in stream: %t: no COMMIT or ROLLBACK may follow", name, inStream)
+		}
+	}
+}
+
+// A statement refused locally because the transaction has expired must not be followed by COMMIT either.
+func (suite *UnitTestSuite) TestQueryModeLocalExpiryDoesNotCommit() {
+	hooks := &txnTestHooks{fn: func(stage string) (bool, error) {
+		return stage == "query", nil
+	}}
+	sent, err := suite.runQueryModeStatement(nil, hooks)
 
 	var expiredErr *TransactionExpiredError
 	suite.Assert().ErrorAs(err, &expiredErr)
+	suite.Assert().Equal([]string{"BEGIN WORK"}, sent, "no COMMIT or ROLLBACK may follow")
+}
+
+// Every translation of a query error that raises EXPIRED leaves the attempt unable to commit.
+func (suite *UnitTestSuite) TestQueryExpiredTranslationsPreventCommit() {
+	expiryErrs := map[string]error{
+		"sdk timeout":        &TimeoutError{InnerError: ErrAmbiguousTimeout},
+		"1080":               &QueryError{Errors: []QueryErrorDesc{{Code: 1080}}},
+		"17010":              &QueryError{Errors: []QueryErrorDesc{{Code: 17010}}},
+		"17010 with a cause": queryTestCauseError(17010, true, false, "failed"),
+	}
+	for name, expiryErr := range expiryErrs {
+		txns := suite.newTxnTestTransactions()
+		_, err := txns.Run(func(ctx *TransactionAttemptContext) error {
+			translated := queryMaybeTranslateToTransactionsError(expiryErr, ctx)
+
+			var tErr *TransactionOperationFailedError
+			suite.Require().ErrorAs(translated, &tErr, name)
+			suite.Assert().Equal(gocbcore.TransactionErrorReasonTransactionExpired, tErr.shouldRaise, name)
+			suite.Assert().False(ctx.canCommit(), "%s: an expired attempt may not be committed", name)
+			return translated
+		}, txnTestOptions(30*time.Second, nil), false)
+
+		var expiredErr *TransactionExpiredError
+		suite.Assert().ErrorAs(err, &expiredErr, name)
+		suite.Require().NoError(txns.close())
+	}
 }
 
 func (suite *UnitTestSuite) TestSingleQueryWithoutOutcomeIsAmbiguous() {

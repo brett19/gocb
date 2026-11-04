@@ -188,6 +188,12 @@ type transactionOperationFailedDef struct {
 }
 
 func operationFailed(def transactionOperationFailedDef, c *TransactionAttemptContext) *TransactionOperationFailedError {
+	// An expired transaction can never be committed. Whatever else the error allows (rolling back, for example), the
+	// Run loop must not go on to send COMMIT after it.
+	if def.Reason == gocbcore.TransactionErrorReasonTransactionExpired {
+		def.ShouldNotCommit = true
+	}
+
 	err := &TransactionOperationFailedError{
 		shouldRetry:       !def.ShouldNotRetry,
 		shouldNotRollback: def.ShouldNotRollback,
