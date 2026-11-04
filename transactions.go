@@ -41,7 +41,7 @@ func (t *Transactions) singleQuery(statement string, scope *Scope, opts QueryOpt
 			// 	ShouldNotRollback: true,
 			// })
 			qRes, err := context.queryWrapper(scope, statement, opts, "query", false, false,
-				nil, true)
+				nil, true, true)
 			if err != nil {
 				return err
 			}
@@ -59,12 +59,12 @@ func (t *Transactions) singleQuery(statement string, scope *Scope, opts QueryOpt
 			}
 
 			if err := qRes.Err(); err != nil {
-				return context.translateStatementError(err, "query", true)
+				return translateStatementError(err, "query", true, context)
 			}
 
 			meta, err := qRes.MetaData()
 			if err != nil {
-				return context.translateStatementError(err, "query", true)
+				return translateStatementError(err, "query", true, context)
 			}
 
 			if meta.Status == QueryStatusFatal {

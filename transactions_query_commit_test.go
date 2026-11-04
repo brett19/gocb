@@ -751,3 +751,139 @@ func (suite *UnitTestSuite) TestQueryModeFailedBeginWorkKeepsOperationFailedErro
 		suite.Assert().ErrorAs(err, &expiredErr, "swallowed: %t", swallow)
 	}
 }
+
+// runQueryModeFailedRollback runs a query mode transaction whose lambda sends one UPDATE statement, answered by
+// stmtErr, and returns it. The auto-rollback's ROLLBACK statement is answered by rollbackErr. It returns the statements
+// sent and the error from the transaction.
+func (suite *UnitTestSuite) runQueryModeFailedRollback(stmtErr, rollbackErr error, hooks TransactionHooks) ([]string,
+	error) {
+	provider := &txnQueryTestProvider{suite: suite}
+	provider.fn = func(statement string) (*QueryResult, error) {
+		switch statement {
+		case "UPDATE `default` SET foo = 1":
+			return nil, stmtErr
+		case "ROLLBACK":
+			return nil, rollbackErr
+		}
+		return nil, nil
+	}
+	txns, _ := suite.newQueryTestTransactions(provider)
+	defer txns.close()
+
+	_, err := txns.Run(func(ctx *TransactionAttemptContext) error {
+		_, err := ctx.Query("UPDATE `default` SET foo = 1", nil)
+		return err
+	}, txnTestOptions(30*time.Second, hooks), false)
+
+	return provider.sent(), err
+}
+
+// The errors with which the ROLLBACK statement of an auto-rollback can fail, each raising a different error from the
+// primary one if it were allowed to set the attempt's state.
+func queryTestRollbackErrors() map[string]error {
+	return map[string]error{
+		"sdk timeout":                   &TimeoutError{InnerError: ErrAmbiguousTimeout},
+		"1080":                          &QueryError{Statement: "ROLLBACK", Errors: []QueryErrorDesc{{Code: 1080}}},
+		"17010":                         &QueryError{Statement: "ROLLBACK", Errors: []QueryErrorDesc{{Code: 17010}}},
+		"cause raises expired":          queryTestCauseError(17007, false, false, "expired"),
+		"cause raises commit_ambiguous": queryTestCauseError(17007, false, false, "commit_ambiguous"),
+		"cause raises failed":           queryTestCauseError(17007, false, false, "failed"),
+		"plain error":                   &QueryError{Statement: "ROLLBACK", InnerError: ErrInternalServerFailure},
+	}
+}
+
+// An error raised by the ROLLBACK statement of an auto-rollback does not set the attempt's state
+// (transactions-stages.md, rollbackInternal, ExtThreadSafety: errors during auto-rollback do not set internal state
+// bits), so the transaction raises the primary error, the one that caused the rollback, and is not retried.
+func (suite *UnitTestSuite) TestQueryModeFailedAutoRollbackRaisesPrimaryError() {
+	primaryErrs := map[string]struct {
+		err         error
+		errorAsType error // the type of error that the transaction raises
+	}{
+		"failed": {
+			err:         queryTestCauseError(17007, true, false, "failed"),
+			errorAsType: &TransactionFailedError{},
+		},
+		"failed, retryable": {
+			err:         queryTestCauseError(17007, true, true, "failed"),
+			errorAsType: &TransactionFailedError{},
+		},
+		"expired": {
+			err:         &TimeoutError{InnerError: ErrAmbiguousTimeout},
+			errorAsType: &TransactionExpiredError{},
+		},
+	}
+	for primaryName, primary := range primaryErrs {
+		for rollbackName, rollbackErr := range queryTestRollbackErrors() {
+			name := primaryName + ", rollback " + rollbackName
+			sent, err := suite.runQueryModeFailedRollback(primary.err, rollbackErr, nil)
+
+			suite.Assert().Equal([]string{"BEGIN WORK", "UPDATE `default` SET foo = 1", "ROLLBACK"}, sent,
+				"%s: one attempt, with no COMMIT", name)
+			suite.Assert().IsType(primary.errorAsType, err, "%s: the primary error is raised", name)
+			// TransactionExpiredError unwraps to ErrAttemptExpired rather than to its cause.
+			var expiredErr *TransactionExpiredError
+			if errors.As(err, &expiredErr) {
+				suite.Assert().ErrorIs(expiredErr.cause, primary.err, "%s: the primary error is the cause", name)
+			} else {
+				suite.Assert().ErrorIs(err, primary.err, "%s: the primary error is the cause", name)
+			}
+		}
+	}
+}
+
+// When the ROLLBACK statement is refused locally because the transaction has expired, the transaction had already
+// expired before the rollback began, so nothing was rolled back: the transaction raises TransactionExpiredError,
+// whatever the primary error was, and is not retried.
+func (suite *UnitTestSuite) TestQueryModeExpiredBeforeAutoRollbackRaisesExpired() {
+	hooks := &txnTestHooks{fn: func(stage string) (bool, error) {
+		return stage == "queryRollback", nil
+	}}
+	primaryErrs := map[string]error{
+		"failed":            queryTestCauseError(17007, true, false, "failed"),
+		"failed, retryable": queryTestCauseError(17007, true, true, "failed"),
+	}
+	for name, primaryErr := range primaryErrs {
+		sent, err := suite.runQueryModeFailedRollback(primaryErr, nil, hooks)
+
+		suite.Assert().Equal([]string{"BEGIN WORK", "UPDATE `default` SET foo = 1"}, sent,
+			"%s: one attempt, with no ROLLBACK or COMMIT sent", name)
+		suite.Assert().IsType(&TransactionExpiredError{}, err, name)
+	}
+}
+
+// A ROLLBACK statement whose errors must not set the attempt's state does not set it, but other statements still do.
+func (suite *UnitTestSuite) TestQueryWrapperUpdateInternalState() {
+	for name, rollbackErr := range queryTestRollbackErrors() {
+		for _, update := range []bool{false, true} {
+			provider := &txnQueryTestProvider{suite: suite}
+			provider.fn = func(statement string) (*QueryResult, error) {
+				if statement == "ROLLBACK" {
+					return nil, rollbackErr
+				}
+				return nil, nil
+			}
+			txns, _ := suite.newQueryTestTransactions(provider)
+
+			_, _ = txns.Run(func(ctx *TransactionAttemptContext) error {
+				_, err := ctx.Query("UPDATE `default` SET foo = 1", nil)
+				suite.Require().NoError(err)
+
+				ctx.queryStateLock.Lock()
+				_, err = ctx.queryWrapperWrapper(ctx.queryState.scope, "ROLLBACK", QueryOptions{Adhoc: true},
+					"queryRollback", false, false, nil, update)
+				ctx.queryStateLock.Unlock()
+				suite.Assert().Error(err, name)
+
+				var tErr *TransactionOperationFailedError
+				isOperationFailed := errors.As(err, &tErr)
+				suite.Assert().Equal(!update || !isOperationFailed, ctx.canCommit(),
+					"%s, update internal state: %t", name, update)
+				suite.Assert().Equal(gocbcore.TransactionErrorReasonSuccess != ctx.finalErrorToRaise(),
+					update && isOperationFailed, "%s, update internal state: %t", name, update)
+				return nil
+			}, txnTestOptions(30*time.Second, nil), false)
+			suite.Require().NoError(txns.close())
+		}
+	}
+}

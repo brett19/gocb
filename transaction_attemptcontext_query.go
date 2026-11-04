@@ -18,7 +18,7 @@ func (c *TransactionAttemptContext) Query(statement string, options *Transaction
 	}
 	c.queryStateLock.Lock()
 	res, err := c.queryWrapperWrapper(opts.Scope, statement, opts.toSDKOptions(), "query", false, true,
-		nil)
+		nil, true)
 	c.queryStateLock.Unlock()
 	if err != nil {
 		return nil, err
@@ -68,7 +68,7 @@ func (c *TransactionAttemptContext) getQueryMode(collection *Collection, id stri
 	res, err := c.queryWrapperWrapper(c.queryState.scope, "EXECUTE __get", QueryOptions{
 		PositionalParameters: []interface{}{c.keyspace(collection), id},
 		Adhoc:                true,
-	}, "queryKvGet", false, true, b)
+	}, "queryKvGet", false, true, b, true)
 	if err != nil {
 		return nil, handleErr(err)
 	}
@@ -191,7 +191,7 @@ func (c *TransactionAttemptContext) replaceQueryMode(doc *TransactionGetResult, 
 	res, err := c.queryWrapperWrapper(c.queryState.scope, "EXECUTE __update", QueryOptions{
 		PositionalParameters: params,
 		Adhoc:                true,
-	}, "queryKvReplace", false, true, b)
+	}, "queryKvReplace", false, true, b, true)
 	if err != nil {
 		return nil, handleErr(err)
 	}
@@ -298,7 +298,7 @@ func (c *TransactionAttemptContext) insertQueryMode(collection *Collection, id s
 	res, err := c.queryWrapperWrapper(c.queryState.scope, "EXECUTE __insert", QueryOptions{
 		PositionalParameters: params,
 		Adhoc:                true,
-	}, "queryKvInsert", false, true, b)
+	}, "queryKvInsert", false, true, b, true)
 	if err != nil {
 		return nil, handleErr(err)
 	}
@@ -385,7 +385,7 @@ func (c *TransactionAttemptContext) removeQueryMode(doc *TransactionGetResult) e
 	_, err = c.queryWrapperWrapper(c.queryState.scope, "EXECUTE __delete", QueryOptions{
 		PositionalParameters: params,
 		Adhoc:                true,
-	}, "queryKvRemove", false, true, b)
+	}, "queryKvRemove", false, true, b, true)
 	if err != nil {
 		return handleErr(err)
 	}
@@ -421,7 +421,7 @@ func (c *TransactionAttemptContext) commitQueryMode() error {
 
 	_, err := c.queryWrapperWrapper(c.queryState.scope, "COMMIT", QueryOptions{
 		Adhoc: true,
-	}, transactionQueryCommitHookPoint, false, true, nil)
+	}, transactionQueryCommitHookPoint, false, true, nil, true)
 	c.txn.UpdateState(gocbcore.TransactionUpdateStateOptions{
 		ShouldNotCommit: true,
 	})
@@ -438,6 +438,15 @@ func (c *TransactionAttemptContext) commitQueryMode() error {
 	return nil
 }
 
+// rollbackQueryMode rolls back a query mode attempt with a ROLLBACK statement.
+//
+// Every rollback that gocb performs is an auto-rollback, done by the Run loop after the lambda; gocb has no app
+// rollback (ctx.rollback()). A TransactionOperationFailedError raised during an auto-rollback does not set the
+// attempt's state bits, so it cannot change the error that the transaction raises: the application cares about what
+// caused the rollback, not about a problem with the rollback itself (transactions-stages.md, rollbackInternal,
+// ExtThreadSafety; transactions-query.md, queryWrapper, updateInternalState). The Run loop then raises the error that
+// caused the rollback, without retrying. Whatever the outcome, the attempt can no longer be committed or rolled back,
+// as for any rollback.
 func (c *TransactionAttemptContext) rollbackQueryMode() error {
 	c.logger.logInfof(c.attemptID, "Performing query mode rollback")
 	handleErr := func(err error) error {
@@ -455,18 +464,22 @@ func (c *TransactionAttemptContext) rollbackQueryMode() error {
 			ShouldNotRollback: true,
 			ErrorCause:        err,
 			Reason:            gocbcore.TransactionErrorReasonTransactionFailed,
-		}, c)
+		}, nil)
 	}
 
 	_, err := c.queryWrapperWrapper(c.queryState.scope, "ROLLBACK", QueryOptions{
 		Adhoc: true,
-	}, "queryRollback", false, false, nil)
+	}, "queryRollback", false, false, nil, false)
 	c.txn.UpdateState(gocbcore.TransactionUpdateStateOptions{
 		ShouldNotRollback: true,
 		ShouldNotCommit:   true,
 	})
 	if err != nil {
-		return handleErr(err)
+		err = handleErr(err)
+		if err != nil {
+			c.logger.logInfof(c.attemptID, "Query mode rollback failed, not updating state: %v", err)
+		}
+		return err
 	}
 
 	c.txn.UpdateState(gocbcore.TransactionUpdateStateOptions{
@@ -510,49 +523,64 @@ const transactionQueryCommitHookPoint = "queryCommit"
 
 // translateStatementError translates an error from sending a statement, or from reading its result. A statement that
 // commits the transaction gets the commit-specific translation; see queryMaybeTranslateCommitStatementError.
-func (c *TransactionAttemptContext) translateStatementError(err error, hookPoint string, txImplicit bool) error {
+//
+// A TransactionOperationFailedError that the translation raises sets the attempt's state from stateCtx, unless it is
+// nil; see queryWrapper.
+func translateStatementError(err error, hookPoint string, txImplicit bool, stateCtx *TransactionAttemptContext) error {
 	if txImplicit || hookPoint == transactionQueryCommitHookPoint {
-		return queryMaybeTranslateCommitStatementError(err, c)
+		return queryMaybeTranslateCommitStatementError(err, stateCtx)
 	}
 
-	return queryMaybeTranslateToTransactionsError(err, c)
+	return queryMaybeTranslateToTransactionsError(err, stateCtx)
+}
+
+// queryStateContext returns the context whose state a TransactionOperationFailedError raised by a statement sets: c,
+// or nil if the statement must not update the attempt's state.
+func (c *TransactionAttemptContext) queryStateContext(updateInternalState bool) *TransactionAttemptContext {
+	if !updateInternalState {
+		return nil
+	}
+	return c
 }
 
 // queryWrapperWrapper is used by any Query based calls on TransactionAttemptContext that require a non-streaming
 // result. It handles converting QueryResult To TransactionQueryResult, handling any errors that occur on the stream,
-// or because of a FATAL status in metadata.
+// or because of a FATAL status in metadata. See queryWrapper for updateInternalState.
 func (c *TransactionAttemptContext) queryWrapperWrapper(scope *Scope, statement string, options QueryOptions, hookPoint string,
-	isBeginWork bool, existingErrorCheck bool, txData []byte) (*TransactionQueryResult, error) {
-	result, err := c.queryWrapper(scope, statement, options, hookPoint, isBeginWork, existingErrorCheck, txData, false)
+	isBeginWork bool, existingErrorCheck bool, txData []byte, updateInternalState bool) (*TransactionQueryResult, error) {
+	result, err := c.queryWrapper(scope, statement, options, hookPoint, isBeginWork, existingErrorCheck, txData, false,
+		updateInternalState)
 	if err != nil {
 		return nil, err
 	}
+
+	stateCtx := c.queryStateContext(updateInternalState)
 
 	var results []json.RawMessage
 	for result.Next() {
 		var r json.RawMessage
 		err = result.Row(&r)
 		if err != nil {
-			return nil, queryMaybeTranslateToTransactionsError(err, c)
+			return nil, queryMaybeTranslateToTransactionsError(err, stateCtx)
 		}
 
 		results = append(results, r)
 	}
 
 	if err := result.Err(); err != nil {
-		return nil, c.translateStatementError(err, hookPoint, false)
+		return nil, translateStatementError(err, hookPoint, false, stateCtx)
 	}
 
 	meta, err := result.MetaData()
 	if err != nil {
-		return nil, c.translateStatementError(err, hookPoint, false)
+		return nil, translateStatementError(err, hookPoint, false, stateCtx)
 	}
 
 	if meta.Status == QueryStatusFatal {
 		return nil, operationFailed(transactionOperationFailedDef{
 			ShouldNotRetry: true,
 			Reason:         gocbcore.TransactionErrorReasonTransactionFailed,
-		}, c)
+		}, stateCtx)
 	}
 
 	return newTransactionQueryResult(results, meta, result.endpoint), nil
@@ -561,10 +589,18 @@ func (c *TransactionAttemptContext) queryWrapperWrapper(scope *Scope, statement 
 // queryWrapper is used by every query based call on TransactionAttemptContext. It handles actually sending the
 // query as well as begin work and setting up query mode state. It returns a streaming QueryResult, handling only
 // errors that occur at query call time.
+//
+// A TransactionOperationFailedError raised here sets the attempt's state bits only if updateInternalState is set
+// (transactions-query.md, queryWrapper, ExtThreadSafety). It is not set for the ROLLBACK statement of an
+// auto-rollback, as errors during an auto-rollback must not change the attempt's state, or the error that the
+// transaction raises.
 func (c *TransactionAttemptContext) queryWrapper(scope *Scope, statement string, options QueryOptions, hookPoint string,
-	isBeginWork bool, existingErrorCheck bool, txData []byte, txImplicit bool) (*QueryResult, error) {
-	c.logger.logInfof(c.attemptID, "Query wrapped running %s, scope level = %t, begin work = %t, txImplicit = %t",
-		redactUserDataString(statement), scope != nil, isBeginWork, txImplicit)
+	isBeginWork bool, existingErrorCheck bool, txData []byte, txImplicit bool, updateInternalState bool) (*QueryResult, error) {
+	c.logger.logInfof(c.attemptID, "Query wrapped running %s, scope level = %t, begin work = %t, txImplicit = %t, "+
+		"update internal state = %t", redactUserDataString(statement), scope != nil, isBeginWork, txImplicit,
+		updateInternalState)
+
+	stateCtx := c.queryStateContext(updateInternalState)
 
 	var target string
 	if !isBeginWork && !txImplicit {
@@ -592,7 +628,7 @@ func (c *TransactionAttemptContext) queryWrapper(scope *Scope, statement string,
 				ErrorCause:        ErrOther,
 				ErrorClass:        gocbcore.TransactionErrorClassFailOther,
 				ShouldNotRollback: true,
-			}, c)
+			}, stateCtx)
 		}
 	}
 
@@ -604,7 +640,7 @@ func (c *TransactionAttemptContext) queryWrapper(scope *Scope, statement string,
 				Reason:         gocbcore.TransactionErrorReasonTransactionFailed,
 				ErrorCause:     ErrPreviousOperationFailed,
 				ErrorClass:     gocbcore.TransactionErrorClassFailOther,
-			}, c)
+			}, stateCtx)
 		}
 	}
 
@@ -616,11 +652,16 @@ func (c *TransactionAttemptContext) queryWrapper(scope *Scope, statement string,
 			Reason:         gocbcore.TransactionErrorReasonTransactionFailed,
 			ErrorCause:     err,
 			ErrorClass:     gocbcore.TransactionErrorClassFailOther,
-		}, c)
+		}, stateCtx)
 	}
 	cfg := c.txn.Config()
 	if cfg.ExpirationTime < 10*time.Millisecond || expired {
 		c.logger.logInfof(c.attemptID, "Transaction expired, failing")
+		// This refusal sets the attempt's state even when updateInternalState is false. A statement refused here was
+		// never sent, so for an auto-rollback's ROLLBACK it means the transaction had already expired before the
+		// rollback began: nothing was rolled back, and the transaction raises TransactionExpiredError, as when expiry
+		// is detected at the first step of a KV rollback. Errors from a rollback that did begin still leave the state
+		// alone, and an expiry refusal can only raise EXPIRED, never COMMIT_AMBIGUOUS.
 		return nil, operationFailed(transactionOperationFailedDef{
 			ShouldNotRetry:    true,
 			ShouldNotRollback: true,
@@ -667,7 +708,7 @@ func (c *TransactionAttemptContext) queryWrapper(scope *Scope, statement string,
 
 	err = c.hooks.BeforeQuery(*c, statement)
 	if err != nil {
-		return nil, queryMaybeTranslateToTransactionsError(err, c)
+		return nil, queryMaybeTranslateToTransactionsError(err, stateCtx)
 	}
 
 	var result *QueryResult
@@ -678,12 +719,12 @@ func (c *TransactionAttemptContext) queryWrapper(scope *Scope, statement string,
 		result, queryErr = scope.Query(statement, &options)
 	}
 	if queryErr != nil {
-		return nil, c.translateStatementError(queryErr, hookPoint, txImplicit)
+		return nil, translateStatementError(queryErr, hookPoint, txImplicit, stateCtx)
 	}
 
 	err = c.hooks.AfterQuery(*c, statement)
 	if err != nil {
-		return nil, queryMaybeTranslateToTransactionsError(err, c)
+		return nil, queryMaybeTranslateToTransactionsError(err, stateCtx)
 	}
 
 	return result, nil
@@ -759,7 +800,7 @@ func (c *TransactionAttemptContext) queryBeginWork(scope *Scope) (errOut error) 
 			ScanConsistency: c.queryConfig.ScanConsistency,
 			Raw:             raw,
 			Adhoc:           true,
-		}, "queryBeginWork", true, false, txdata)
+		}, "queryBeginWork", true, false, txdata, true)
 		if err != nil {
 			errOut = queryBeginWorkFailed(err, c)
 			waitCh <- struct{}{}
