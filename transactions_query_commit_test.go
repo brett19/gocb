@@ -650,3 +650,104 @@ func (suite *UnitTestSuite) TestKVModeEncodeFailureDoesNotCommit() {
 		}
 	}
 }
+
+// runQueryModeFailedBeginWork runs a transaction whose lambda sends one statement, the BEGIN WORK of which fails with
+// beginErr. If swallow is set, the lambda ignores the error and sends a second statement. It returns the statements
+// sent and the error from the transaction.
+func (suite *UnitTestSuite) runQueryModeFailedBeginWork(beginErr error, swallow bool,
+	check func(ctx *TransactionAttemptContext, err error)) ([]string, error) {
+	provider := &txnQueryTestProvider{suite: suite}
+	provider.fn = func(statement string) (*QueryResult, error) {
+		if statement == "BEGIN WORK" {
+			return nil, beginErr
+		}
+		return nil, nil
+	}
+	txns, _ := suite.newQueryTestTransactions(provider)
+	defer txns.close()
+
+	_, err := txns.Run(func(ctx *TransactionAttemptContext) error {
+		_, err := ctx.Query("UPDATE `default` SET foo = 1", nil)
+		check(ctx, err)
+		if !swallow {
+			return err
+		}
+
+		_, err = ctx.Query("UPDATE `default` SET foo = 2", nil)
+		suite.Assert().Error(err, "a statement after a failed BEGIN WORK must fail")
+		return nil
+	}, txnTestOptions(30*time.Second, nil), false)
+
+	return provider.sent(), err
+}
+
+// A BEGIN WORK that fails with a plain error is fatal to the transaction (transactions-query.md, queryBeginWork):
+// it raises Error(cause=err, ec=FAIL_OTHER, retry=false, rollback=true), and the attempt does not enter query mode.
+// So no COMMIT follows, whether the lambda returns the error or swallows it, no further statement is sent, and the
+// transaction is not retried. The rollback is a KV rollback, which sends no ROLLBACK statement.
+func (suite *UnitTestSuite) TestQueryModeFailedBeginWorkIsFatal() {
+	// Each BEGIN WORK error, with the cause that the transaction fails with: the query error handling translates some
+	// codes into plain errors.
+	beginErrs := map[string]struct {
+		err   error
+		cause error
+	}{
+		"syntax error": {err: &QueryError{Statement: "BEGIN WORK", InnerError: ErrParsingFailure,
+			Errors: []QueryErrorDesc{{Code: 3000}}}, cause: ErrParsingFailure},
+		"no error codes": {err: &QueryError{Statement: "BEGIN WORK", InnerError: ErrInternalServerFailure},
+			cause: ErrInternalServerFailure},
+		"17004": {err: &QueryError{Statement: "BEGIN WORK", InnerError: ErrInternalServerFailure,
+			Errors: []QueryErrorDesc{{Code: 17004}}}, cause: ErrAttemptNotFoundOnQuery},
+		"17012": {err: &QueryError{Statement: "BEGIN WORK", InnerError: ErrInternalServerFailure,
+			Errors: []QueryErrorDesc{{Code: 17012}}}, cause: ErrDocumentExists},
+		"other": {err: errTxnTest, cause: errTxnTest},
+	}
+	for name, tc := range beginErrs {
+		for _, swallow := range []bool{false, true} {
+			sent, err := suite.runQueryModeFailedBeginWork(tc.err, swallow,
+				func(ctx *TransactionAttemptContext, err error) {
+					var tErr *TransactionOperationFailedError
+					if suite.Assert().ErrorAs(err, &tErr, "%s, swallowed: %t", name, swallow) {
+						suite.Assert().Equal(gocbcore.TransactionErrorReasonTransactionFailed, tErr.shouldRaise, name)
+						suite.Assert().Equal(gocbcore.TransactionErrorClassFailOther, tErr.errorClass, name)
+						suite.Assert().False(tErr.Retry(), name)
+						suite.Assert().True(tErr.Rollback(), name)
+						suite.Assert().ErrorIs(tErr.InternalUnwrap(), tc.cause, name)
+					}
+					suite.Assert().False(ctx.canCommit(), "%s: a failed BEGIN WORK may not be committed", name)
+					suite.Assert().False(ctx.queryModeLocked(), "%s: a failed BEGIN WORK does not enter query mode",
+						name)
+				})
+
+			suite.Assert().Equal([]string{"BEGIN WORK"}, sent,
+				"%s, swallowed: %t: no COMMIT, ROLLBACK or further statement may follow", name, swallow)
+			var failedErr *TransactionFailedError
+			suite.Assert().ErrorAs(err, &failedErr, "%s, swallowed: %t", name, swallow)
+			if !swallow {
+				suite.Assert().ErrorIs(err, tc.cause, name)
+			}
+		}
+	}
+}
+
+// A BEGIN WORK that fails with an error that the query error handling raises as a TransactionOperationFailedError
+// keeps that error's verdict: an expiry raises EXPIRED, and does not allow rollback.
+func (suite *UnitTestSuite) TestQueryModeFailedBeginWorkKeepsOperationFailedError() {
+	for _, swallow := range []bool{false, true} {
+		sent, err := suite.runQueryModeFailedBeginWork(
+			&QueryError{Statement: "BEGIN WORK", Errors: []QueryErrorDesc{{Code: 1080}}}, swallow,
+			func(ctx *TransactionAttemptContext, err error) {
+				var tErr *TransactionOperationFailedError
+				if suite.Assert().ErrorAs(err, &tErr, "swallowed: %t", swallow) {
+					suite.Assert().Equal(gocbcore.TransactionErrorReasonTransactionExpired, tErr.shouldRaise)
+					suite.Assert().False(tErr.Rollback())
+				}
+				suite.Assert().False(ctx.canCommit())
+				suite.Assert().False(ctx.queryModeLocked())
+			})
+
+		suite.Assert().Equal([]string{"BEGIN WORK"}, sent, "swallowed: %t: no COMMIT or ROLLBACK may follow", swallow)
+		var expiredErr *TransactionExpiredError
+		suite.Assert().ErrorAs(err, &expiredErr, "swallowed: %t", swallow)
+	}
+}

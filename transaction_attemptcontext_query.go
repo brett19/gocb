@@ -735,15 +735,10 @@ func (c *TransactionAttemptContext) queryBeginWork(scope *Scope) (errOut error) 
 					errorClass:        coreErr.ErrorClass(),
 				}
 			} else {
-				errOut = err
+				errOut = operationFailedFromError(err, c)
 			}
 			waitCh <- struct{}{}
 			return
-		}
-
-		// Store any scope for later operations.
-		c.queryState = &transactionQueryState{
-			scope: scope,
 		}
 
 		cfg := c.txn.Config()
@@ -766,23 +761,57 @@ func (c *TransactionAttemptContext) queryBeginWork(scope *Scope) (errOut error) 
 			Adhoc:           true,
 		}, "queryBeginWork", true, false, txdata)
 		if err != nil {
-			errOut = err
+			errOut = queryBeginWorkFailed(err, c)
 			waitCh <- struct{}{}
 			return
 		}
 
+		// Only now that BEGIN WORK has succeeded do we enter query mode, storing the scope and the query target for
+		// later operations.
 		c.logger.logInfof(c.attemptID, "Begin work setting query target to %s", res.endpoint)
-		c.queryState.queryTarget = res.endpoint
+		c.queryState = &transactionQueryState{
+			scope:       scope,
+			queryTarget: res.endpoint,
+		}
 
 		waitCh <- struct{}{}
 	})
 	if err != nil {
-		errOut = err
+		errOut = operationFailedFromError(err, c)
 		return
 	}
 	<-waitCh
 
 	return
+}
+
+// queryBeginWorkFailed converts err, from a BEGIN WORK statement that failed, into the error that queryBeginWork
+// raises.
+//
+// Any failure of BEGIN WORK is fatal to the transaction (transactions-query.md, queryBeginWork, Handling of failure:
+// "Error(cause=err, ec=FAIL_OTHER, retry=false, rollback=true)"). Statement level atomicity does not apply, as from the
+// query service's point of view the attempt has not begun until BEGIN WORK succeeds, so unlike a failed statement in
+// query mode a plain error is not returned to the lambda: it would leave the attempt committable. A
+// TransactionOperationFailedError has already been raised by the query error handling, which follows the spec's rules
+// for the error (an expiry, for example, does not allow rollback), and is returned as it is.
+//
+// The attempt does not enter query mode: the rollback that follows the failure is a KV rollback, of any KV operations
+// that the attempt performed before BEGIN WORK. The query service may have opened the transaction even though BEGIN
+// WORK failed, for example if the statement timed out on the SDK side, but it is not sent a ROLLBACK: the attempt has
+// no query target to send it to, and the query service owns, and cleans up, any transaction it has opened.
+func queryBeginWorkFailed(err error, c *TransactionAttemptContext) error {
+	var tErr *TransactionOperationFailedError
+	if errors.As(err, &tErr) {
+		return err
+	}
+
+	return operationFailed(transactionOperationFailedDef{
+		ShouldNotRetry:    true,
+		ShouldNotRollback: false,
+		Reason:            gocbcore.TransactionErrorReasonTransactionFailed,
+		ErrorCause:        err,
+		ErrorClass:        gocbcore.TransactionErrorClassFailOther,
+	}, c)
 }
 
 func (c *TransactionAttemptContext) keyspace(collection *Collection) string {
