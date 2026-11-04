@@ -434,7 +434,7 @@ func (c *TransactionAttemptContext) commitQueryMode() error {
 
 	_, err := c.queryWrapperWrapper(c.queryState.scope, "COMMIT", QueryOptions{
 		Adhoc: true,
-	}, "queryCommit", false, true, nil)
+	}, transactionQueryCommitHookPoint, false, true, nil)
 	c.txn.UpdateState(gocbcore.TransactionUpdateStateOptions{
 		ShouldNotCommit: true,
 	})
@@ -519,6 +519,19 @@ func durabilityLevelToQueryString(level gocbcore.TransactionDurabilityLevel) str
 	return ""
 }
 
+// transactionQueryCommitHookPoint is the hook point of the COMMIT statement.
+const transactionQueryCommitHookPoint = "queryCommit"
+
+// translateStatementError translates an error from sending a statement, or from reading its result. A statement that
+// commits the transaction gets the commit-specific translation; see queryMaybeTranslateCommitStatementError.
+func (c *TransactionAttemptContext) translateStatementError(err error, hookPoint string, txImplicit bool) error {
+	if txImplicit || hookPoint == transactionQueryCommitHookPoint {
+		return queryMaybeTranslateCommitStatementError(err, c)
+	}
+
+	return queryMaybeTranslateToTransactionsError(err, c)
+}
+
 // queryWrapperWrapper is used by any Query based calls on TransactionAttemptContext that require a non-streaming
 // result. It handles converting QueryResult To TransactionQueryResult, handling any errors that occur on the stream,
 // or because of a FATAL status in metadata.
@@ -541,12 +554,12 @@ func (c *TransactionAttemptContext) queryWrapperWrapper(scope *Scope, statement 
 	}
 
 	if err := result.Err(); err != nil {
-		return nil, queryMaybeTranslateToTransactionsError(err, c)
+		return nil, c.translateStatementError(err, hookPoint, false)
 	}
 
 	meta, err := result.MetaData()
 	if err != nil {
-		return nil, queryMaybeTranslateToTransactionsError(err, c)
+		return nil, c.translateStatementError(err, hookPoint, false)
 	}
 
 	if meta.Status == QueryStatusFatal {
@@ -677,7 +690,7 @@ func (c *TransactionAttemptContext) queryWrapper(scope *Scope, statement string,
 		result, queryErr = scope.Query(statement, &options)
 	}
 	if queryErr != nil {
-		return nil, queryMaybeTranslateToTransactionsError(queryErr, c)
+		return nil, c.translateStatementError(queryErr, hookPoint, txImplicit)
 	}
 
 	err = c.hooks.AfterQuery(*c, statement)

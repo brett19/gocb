@@ -1,8 +1,12 @@
 package gocb
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net"
+
 	"github.com/couchbase/gocbcore/v10"
 )
 
@@ -108,6 +112,72 @@ func queryMaybeTranslateToTransactionsError(err error, c *TransactionAttemptCont
 	return queryErr
 }
 
+// queryOutcomeUnknown reports whether err means that a statement ended without a definite answer from the query
+// service: the statement may or may not have been executed, and the SDK cannot tell which.
+//
+// A response from the query service that carries errors is definite, and so is an unambiguous timeout, which gocbcore
+// only raises when the request was not sent or was rejected before it was processed. An ambiguous timeout, a
+// cancellation, and a connection that is lost while the request is in flight are not.
+func queryOutcomeUnknown(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var queryErr *QueryError
+	if errors.As(err, &queryErr) && len(queryErr.Errors) > 0 {
+		return false
+	}
+
+	if errors.Is(err, ErrUnambiguousTimeout) {
+		return false
+	}
+
+	if errors.Is(err, ErrTimeout) || errors.Is(err, ErrRequestCanceled) ||
+		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+
+	// A failure to resolve or to connect means that the request was never sent.
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return false
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return opErr.Op != "dial"
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
+}
+
+// queryMaybeTranslateCommitStatementError translates an error from a statement that commits a transaction: COMMIT in
+// query mode, or the single statement of a single query transaction (tximplicit), which commits the transaction that
+// the query service runs for it.
+//
+// The query service performs the whole commit within the statement, and then discards the transaction. So if the
+// statement ends without a definite answer, the transaction may have committed, and the outcome is ambiguous. It is
+// not expired, which tells the application that the transaction did not commit, and it must not be rolled back: the
+// query service would reject a ROLLBACK, as the transaction is no longer present, or ignore it while the commit is
+// still running. Any other error is translated as for any other statement.
+func queryMaybeTranslateCommitStatementError(err error, c *TransactionAttemptContext) error {
+	if queryOutcomeUnknown(err) {
+		return operationFailed(transactionOperationFailedDef{
+			ShouldNotRetry:    true,
+			ShouldNotRollback: true,
+			ShouldNotCommit:   true,
+			Reason:            gocbcore.TransactionErrorReasonTransactionCommitAmbiguous,
+			ErrorCause:        err,
+			ErrorClass:        gocbcore.TransactionErrorClassFailAmbiguous,
+		}, c)
+	}
+
+	return queryMaybeTranslateToTransactionsError(err, c)
+}
+
 type transactionOperationFailedDef struct {
 	ShouldNotRetry    bool
 	ShouldNotRollback bool
@@ -150,7 +220,7 @@ func (c *TransactionAttemptContext) updateState(def transactionOperationFailedDe
 }
 
 func singleQueryErrToTransactionError(err error, txnID string) error {
-	err = queryMaybeTranslateToTransactionsError(err, nil)
+	err = queryMaybeTranslateCommitStatementError(err, nil)
 
 	var tErr *TransactionOperationFailedError
 	if errors.As(err, &tErr) {

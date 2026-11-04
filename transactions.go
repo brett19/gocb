@@ -59,12 +59,12 @@ func (t *Transactions) singleQuery(statement string, scope *Scope, opts QueryOpt
 			}
 
 			if err := qRes.Err(); err != nil {
-				return queryMaybeTranslateToTransactionsError(err, context)
+				return context.translateStatementError(err, "query", true)
 			}
 
 			meta, err := qRes.MetaData()
 			if err != nil {
-				return queryMaybeTranslateToTransactionsError(err, context)
+				return context.translateStatementError(err, "query", true)
 			}
 
 			if meta.Status == QueryStatusFatal {
